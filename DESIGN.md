@@ -4,7 +4,7 @@
 
 PulseRoute is a software-defined WAN control and decision prototype for remote devices. It identifies business and productivity traffic, selects a preferred path for it, and exposes routing status to an end user. The repository separates browser presentation, control-plane state, policy distribution, data-plane decisions, and observability so each can evolve independently.
 
-The current implementation is safe to run locally: it makes and records routing decisions but does not intercept host traffic. A platform-native enforcer will consume the same data-plane API for real traffic handling.
+The Go service layer is safe to run locally: it makes and records routing decisions without intercepting host traffic. On Linux, a separately installed, root-owned native enforcer can consume the same data-plane API to apply policy routing and QoS to WireGuard overlay traffic. macOS and Windows enforcement remain platform-specific delivery work.
 
 ## Goals
 
@@ -17,7 +17,8 @@ The current implementation is safe to run locally: it makes and records routing 
 
 ## Non-Goals
 
-- Go services do not configure OS routes, WireGuard, VPN tunnels, QoS, eBPF, nftables, or Windows Filtering Platform rules.
+- Go services do not configure OS routes, WireGuard peers, VPN tunnels, eBPF, or Windows Filtering Platform rules.
+- The Linux enforcer does not create a WireGuard peer, discover application hostnames, or guarantee upstream DSCP treatment. A deployment-managed WireGuard configuration and an authoritative DNS/SNI flow collector remain required.
 - Docker containers do not intercept macOS, Windows, or host Linux traffic.
 - Control-plane state is in memory and resets on restart.
 - The initial policy feed is static Go data, not yet remotely administered or signed.
@@ -51,6 +52,10 @@ cmd/
   observability/metrics-server/     Performance and bandwidth ingestion
 internal/policy/                    Shared policy snapshot and hostname matching
 deploy/                             Docker image, Compose stack, environment template
+native/
+  linux/enforcer/                   Root-owned WireGuard route and QoS enforcer
+  linux/systemd/                    Fail-open enforcement watchdog unit
+  macos/                            Packet Tunnel provider source scaffold
 CodeWalkThrough.md                  Service and request-flow guide
 README.md                           Setup and API reference
 ```
@@ -71,7 +76,7 @@ README.md                           Setup and API reference
 
 ### Data-Plane Agent
 
-`dataplane-agent` accepts an observed hostname at `POST /v1/flows/evaluate`. It caches the policy snapshot for 30 seconds. A matched hostname returns `priority-overlay` and high priority; unmatched traffic returns `direct-internet` and standard priority. `DATAPLANE_MODE=observe` reports only; `enforce` tells a native adapter it may act but does not change host routing itself.
+`dataplane-agent` accepts an observed hostname at `POST /v1/flows/evaluate`. It caches the policy snapshot for 30 seconds. A matched hostname returns `priority-overlay` and high priority; unmatched traffic returns `direct-internet` and standard priority. `DATAPLANE_MODE=observe` reports only. `enforce` permits a platform-native adapter to apply its own routing and QoS behavior; the agent never executes privileged operating-system commands.
 
 ### Observability
 
@@ -95,7 +100,7 @@ README.md                           Setup and API reference
 | --- | --- | --- |
 | `POST` | `/v1/flows/evaluate` | `{"hostname":"api.github.com"}` | Priority-overlay or direct-internet decision. |
 
-A decision includes `action`, `priority`, optional `matchedRule`, `policyVersion`, and `mode`. The native adapter must use a priority overlay only while it is healthy; a failure falls back to direct internet.
+A decision includes `action`, `priority`, optional `matchedRule`, `policyVersion`, and `mode`. The native adapter must use a priority overlay only while it is healthy; a failure falls back to direct internet. On Linux, QoS is eligible only when all three conditions hold: `mode` is `enforce`, `action` is `priority-overlay`, and `priority` is `high`.
 
 ### Observability
 
@@ -106,7 +111,7 @@ A decision includes `action`, `priority`, optional `matchedRule`, `policyVersion
 ## Security Boundaries
 
 - `POLICY_SERVICE_TOKEN` protects policy snapshot access. It must be a unique runtime secret of at least 32 characters.
-- `INFLUXDB_ADMIN_TOKEN` initializes the local database and Grafana. Production must use separate, scoped service credentials from a secret manager.
+- `INFLUXDB_ADMIN_TOKEN` initializes the local database. `GRAFANA_ADMIN_PASSWORD` is a distinct Grafana login secret. Production must use separate, scoped service credentials from a secret manager; neither administrator credential should be used by an application workload.
 - Custom Go containers run non-root with a read-only filesystem, `/tmp` tmpfs, dropped Linux capabilities, and `no-new-privileges`.
 - UI responses include `X-Content-Type-Options: nosniff` and `X-Frame-Options: DENY`.
 - Data-plane and metrics request bodies are size-limited before JSON decoding.
@@ -119,23 +124,24 @@ cp deploy/.env.example .env
 docker compose -f deploy/docker-compose.yml up --build
 ```
 
-The UI runs on `http://localhost:8080`, Grafana on `http://localhost:3000`, and local decision and metrics APIs on `8082` and `8083`. Run `go test ./...` before packaging changes. Health endpoints exist for UI, policy, data-plane, and metrics services.
+The UI runs on `http://localhost:8080`, Grafana on `http://localhost:3000`, and local decision and metrics APIs on `8082` and `8083`. Compose health-gates dependent services: UI waits for control-plane liveness; the agent waits for policy readiness; metrics and Grafana wait for InfluxDB. Run `go test ./...` before packaging changes. The agent's `/readyz` endpoint validates that a policy snapshot is available; metrics `/readyz` validates InfluxDB reachability.
 
 ## Platform-Native Enforcement
 
 The Go service layer is portable. Only interception and enforcement differ by OS:
 
-- **Linux/Ubuntu**: a managed root component uses eBPF or nftables to classify flows, calls the agent, marks overlay traffic, and selects a WireGuard route table. It must retain a direct default route and remove priority rules if the tunnel fails.
+- **Linux/Ubuntu**: the implemented `pulseroute-enforcer` uses nftables destination sets, an output-chain firewall mark, and an `ip rule` plus dedicated route table to steer approved IPv4 destinations through a pre-existing WireGuard device. It configures HTB classes on that device. High-priority overlay decisions are entered in a separate set, receive configured DSCP (`cs5` by default), and select HTB class `1:10`; standard overlay traffic uses the default class. `uninstall` deletes only PulseRoute's nftables table, route rule/table, and root qdisc. The `pulseroute-enforcer.service` watchdog checks local agent readiness and WireGuard device existence; on failure it removes those rules so traffic returns to the normal direct route. The root-owned JSON configuration includes the WireGuard device, route table, firewall mark, link rate, high-priority allocation, DSCP, and watchdog interval. It must not contain WireGuard private keys.
 - **macOS**: a signed Packet Tunnel Network Extension receives packets with `NEPacketTunnelFlow`, consults the local agent, and forwards approved traffic over the overlay. It requires Apple Network Extension entitlement, provisioning, user approval, and notarized packaging.
 - **Windows**: a signed least-privileged service uses Windows Filtering Platform to associate flows with hostname metadata, calls the agent, and selects overlay or direct routing.
 
-Every adapter should begin in observe mode, emit measurements, be canaried to managed devices, and preserve direct internet as the failure path.
+Linux operators must set WireGuard `PersistentKeepalive` and add gateway-path monitoring: interface existence alone does not prove the overlay peer is reachable. The enforcer accepts IPv4 destinations only; IPv6 policy enforcement is not implemented. Every adapter should begin in observe mode, emit measurements, be canaried to managed devices, and preserve direct internet as the failure path.
 
 ## Production Readiness Roadmap
 
 1. Replace static policy data with signed, versioned, remotely managed policies.
 2. Add mutual TLS or per-device credentials for services and gateway.
-3. Build native adapters and a health-checked authenticated overlay gateway.
-4. Add durable state, audit logs, Grafana provisioning, alerts, and dashboards.
-5. Add integration tests for policy refresh, tunnel loss, fail-open, upgrades, and rollback.
-6. Add pinned image digests, vulnerability scans, SBOMs, image signing, and CI release artifacts.
+3. Deliver an authenticated, health-checked WireGuard gateway configuration and an authoritative DNS/SNI flow collector for the Linux enforcer.
+4. Build, sign, and distribute the macOS Packet Tunnel and Windows Filtering Platform adapters.
+5. Add durable state, audit logs, Grafana provisioning, alerts, and dashboards.
+6. Add Linux integration tests for policy refresh, WireGuard loss, fail-open, upgrades, rollback, and DSCP/HTB behavior.
+7. Add pinned image digests, vulnerability scans, SBOMs, image signing, and CI release artifacts.
