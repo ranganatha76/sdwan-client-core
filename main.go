@@ -45,6 +45,7 @@ type clientState struct {
 }
 
 type server struct {
+	// Protects the shared client state while dashboard requests update policies.
 	mu    sync.RWMutex
 	state clientState
 }
@@ -63,6 +64,7 @@ func main() {
 }
 
 func initialState() clientState {
+	// These defaults represent the centrally distributed work-traffic policy.
 	return clientState{
 		Connected: true,
 		Location:  "Seattle, WA",
@@ -116,6 +118,7 @@ func (s *server) togglePolicy(w http.ResponseWriter, r *http.Request) {
 		}
 		app.Active = !app.Active
 		if app.Active {
+			// Re-enabled work policies resume high-priority path steering.
 			app.Priority = "High"
 			app.Health, app.Route = "Protected", selectedPath(s.state.Paths).Name
 		} else {
@@ -135,6 +138,7 @@ func (s *server) optimize(w http.ResponseWriter, r *http.Request) {
 	bestIndex := 0
 	for index := range s.state.Paths {
 		current := &s.state.Paths[index]
+		// The prototype perturbs synthetic probes to emulate changing home links.
 		current.Latency = max(12, current.Latency+rand.IntN(9)-4)
 		current.Jitter = max(2, current.Jitter+rand.IntN(5)-2)
 		current.Score = min(99, max(72, 100-current.Latency/2-current.Jitter))
@@ -147,6 +151,7 @@ func (s *server) optimize(w http.ResponseWriter, r *http.Request) {
 	}
 	for index := range s.state.Apps {
 		if s.state.Apps[index].Active {
+			// Only protected applications follow the selected SD-WAN path.
 			s.state.Apps[index].Route = s.state.Paths[bestIndex].Name
 		}
 	}
@@ -187,6 +192,7 @@ func writeJSON(w http.ResponseWriter, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+// page is kept embedded so the prototype runs as one Go binary with no frontend build step.
 const page = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PulseRoute</title>
 <style>
