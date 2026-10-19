@@ -116,15 +116,36 @@ For a hostname that does not match a work rule, the response is similar to:
 
 `direct-internet` means household and unrelated traffic keeps its normal route. This avoids consuming tunnel capacity or degrading personal traffic.
 
+## Split-Tunnel Routing and Performance
+
+PulseRoute uses split tunneling: the WireGuard tunnel runs between the managed device and the SD-WAN gateway, not between an application and the gateway. Recognized work traffic, such as Zoom, Slack, Teams, GitHub, Bitbucket, and configured productivity services, is eligible for the tunnel. Other applications keep using the device's normal direct internet route.
+
+```text
+Matched work hostname
+	-> data-plane policy decision
+	-> Linux nftables route mark and QoS class
+	-> WireGuard tunnel to the SD-WAN gateway
+	-> gateway route to the SaaS service
+
+Unmatched hostname
+	-> direct normal internet route
+```
+
+On Linux, an enforce-mode `priority-overlay` decision adds an IPv4 destination to the WireGuard policy-route set. A `priority: high` decision also receives the configured DSCP value (`cs5` by default) and preferred HTB scheduling on the WireGuard interface. This protects collaboration and productivity traffic from local uplink congestion; it does not guarantee bandwidth or preserve DSCP beyond the local network.
+
+The overlay improves performance only when the SD-WAN gateway has a better onward path to the SaaS service, such as lower congestion, better peering, or a private backbone. Without that better path, encryption and the extra gateway hop can make traffic slightly slower.
+
+The Linux enforcer can apply an explicit hostname and destination-IP evaluation. Automatic application routing still requires an authoritative DNS/SNI flow collector to observe hostname-to-IP mappings and refresh them safely as SaaS destinations change.
+
 ### Observe and enforce modes
 
 `DATAPLANE_MODE=observe` is the default. The agent records and returns decisions but makes no operating-system routing changes. It is the appropriate mode for local validation and rollout telemetry.
 
-`DATAPLANE_MODE=enforce` still requires a platform-native adapter to apply the decision. On macOS, that is a signed Network Extension Packet Tunnel; on Linux/Ubuntu, it is an eBPF or nftables classifier combined with WireGuard; on Windows, it is a Windows Filtering Platform adapter. That component must fail open to direct internet if the tunnel or local agent becomes unhealthy.
+`DATAPLANE_MODE=enforce` still requires a platform-native adapter to apply the decision. On macOS, that is a signed Network Extension Packet Tunnel; on Linux/Ubuntu, the supplied nftables/WireGuard enforcer applies policy routing and QoS after an authoritative hostname collector invokes it; on Windows, it is a Windows Filtering Platform adapter. That component must fail open to direct internet if the tunnel or local agent becomes unhealthy.
 
 ## Scope
 
-The containerized agent is a policy-decision service, not a host packet interceptor. It does not yet configure a real tunnel, VPN, QoS, or eBPF rules.
+The containerized agent is a policy-decision service, not a host packet interceptor. It does not configure a WireGuard peer, gateway, or host routes. The separately installed Linux enforcer configures only PulseRoute-owned nftables, policy-routing, and QoS state; it does not create the WireGuard tunnel itself.
 
 ## Native Enforcement Prerequisites
 

@@ -136,6 +136,61 @@ The Go service layer is portable. Only interception and enforcement differ by OS
 
 Linux operators must set WireGuard `PersistentKeepalive` and add gateway-path monitoring: interface existence alone does not prove the overlay peer is reachable. The enforcer accepts IPv4 destinations only; IPv6 policy enforcement is not implemented. Every adapter should begin in observe mode, emit measurements, be canaried to managed devices, and preserve direct internet as the failure path.
 
+### Linux Packet and Tunnel Flow
+
+The WireGuard tunnel is a device-to-gateway transport. It is not an application-specific tunnel and it does not terminate at Zoom, Slack, Teams, GitHub, or any other SaaS provider. The laptop encrypts selected inner IP packets and sends the resulting WireGuard UDP packets to the SD-WAN gateway. The gateway decrypts them and forwards the original packets to the SaaS destination using its managed egress path.
+
+```mermaid
+flowchart LR
+  App[Zoom, Slack, Teams, GitHub] --> Collector[DNS/SNI hostname collector]
+  Collector --> Agent[Local data-plane agent]
+  Agent -->|enforce + priority-overlay| Enforcer[Linux nftables and ip rule]
+  Enforcer -->|Selected inner IPv4 packet| WG[WireGuard interface on laptop]
+  WG -->|Encrypted UDP tunnel| Gateway[SD-WAN gateway]
+  Gateway -->|Managed egress route| SaaS[SaaS destination]
+  SaaS --> Gateway
+  Gateway -->|Encrypted return packet| WG
+  WG --> App
+  Personal[Unmatched personal traffic] --> Direct[Normal direct internet route]
+```
+
+#### Policy Decision to Packet State
+
+1. A hostname collector associates a DNS answer, TLS SNI value, or approved application rule with a destination IP address.
+2. The collector calls `POST /v1/flows/evaluate` on the local data-plane agent.
+3. The agent returns an auditable decision containing `action`, `priority`, `matchedRule`, `policyVersion`, and `mode`.
+4. The Linux enforcer changes kernel packet state only when `mode` is `enforce` and `action` is `priority-overlay`.
+5. The enforcer adds the approved IPv4 destination to `inet pulseroute priority_destinations` with a ten-minute expiry. Destinations that also have `priority: high` are added to `high_priority_destinations`.
+
+The expiry limits stale SaaS IP mappings. A production collector must refresh mappings before expiry, remove mappings when policy no longer matches, and avoid routing a shared CDN address through the overlay unless policy explicitly authorizes it.
+
+#### Packet Changes on the Laptop
+
+For a destination in `priority_destinations`, the nftables output route chain applies `firewallMark`. The kernel `ip rule` matches that mark and looks up the configured dedicated route table. That route table sends the inner IPv4 packet to the configured WireGuard device, for example `wg-pulseroute`, rather than the laptop's normal default route.
+
+For a destination in `high_priority_destinations`, the QoS output chain additionally sets the configured DSCP class, `cs5` by default, and selects Linux traffic-control class `1:10`. The enforcer installs an HTB root qdisc on the WireGuard device with:
+
+- Class `1:10`: high-priority work traffic, configured minimum `highPriorityRateMbit`, allowed to borrow up to `linkRateMbit`.
+- Class `1:30`: default overlay traffic, configured as the lower scheduling priority.
+
+This scheduling decision is local to the laptop's egress queue. The gateway and intermediate networks may rewrite or ignore DSCP, so PulseRoute does not claim end-to-end QoS. The packet's WireGuard outer UDP encapsulation is encrypted between laptop and gateway; the inner packet is decrypted only at the gateway before normal forwarding.
+
+#### Gateway and Return-Path Requirements
+
+The SD-WAN gateway is outside this repository and must be provisioned separately. It needs a WireGuard peer for the laptop, a tunnel address plan, forwarding enabled, firewall policy, and either source NAT or explicit return routes so replies to selected SaaS flows return through the same tunnel. It must have a managed egress path that is measurably better than the laptop's direct ISP path for the selected services; otherwise the extra tunnel hop can increase latency.
+
+The WireGuard configuration owns endpoint address and port, gateway public key, laptop private key, tunnel address, `AllowedIPs`, and `PersistentKeepalive`. Private keys and gateway credentials stay in root-owned deployment configuration or a secrets system and are never written to the PulseRoute repository or Docker environment.
+
+#### Direct Traffic and Fail-Open Behavior
+
+Traffic that has no matching policy destination receives no PulseRoute firewall mark, no dedicated route-table lookup, and no WireGuard QoS class. It follows the operating system's existing normal default route directly to the internet.
+
+The watchdog checks local data-plane-agent readiness and WireGuard device existence. When either check fails, it removes the PulseRoute nftables table, policy rule, dedicated route table entries, and WireGuard qdisc. This makes the normal direct route the remaining path. Interface existence does not prove gateway reachability, so production deployments also need WireGuard peer handshake checks and active gateway-path health probes before retaining overlay routing.
+
+#### Current Enforcement Boundary
+
+The repository implements explicit Linux destination evaluation and application of nftables, policy-routing, DSCP, and HTB state. It does not yet implement the authoritative DNS/SNI collector, WireGuard peer provisioning, gateway forwarding/NAT, IPv6 split tunneling, or active gateway-path measurement. Those components are required before claiming autonomous per-application production steering.
+
 ## Production Readiness Roadmap
 
 1. Replace static policy data with signed, versioned, remotely managed policies.
