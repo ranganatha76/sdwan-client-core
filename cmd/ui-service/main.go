@@ -9,7 +9,10 @@ import (
 	"time"
 )
 
-// main starts the browser-facing UI and proxies its API calls to the control plane.
+// main starts the browser-facing UI service and its control-plane API proxy.
+// It resolves the upstream URL from configuration, defaulting to the Compose service name.
+// It serves the static dashboard locally while forwarding all API paths to the control plane.
+// The port-8080 server applies baseline security headers and bounded HTTP timeouts.
 func main() {
 	controlPlaneURL := os.Getenv("CONTROL_PLANE_URL")
 	if controlPlaneURL == "" {
@@ -38,15 +41,27 @@ func main() {
 	log.Fatal(server.ListenAndServe())
 }
 
+// health reports that the browser-facing UI process is available to serve requests.
+// It does not contact the control plane, keeping liveness independent of upstream availability.
+// Container probes receive an empty 204 response when the UI listener is running.
+// Browser API availability is separately represented by proxied request outcomes.
 func health(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// dashboard returns the static HTML, styles, and JavaScript for the local web console.
+// It declares HTML with UTF-8 encoding so browsers render the embedded page correctly.
+// Dynamic routing state is fetched by the page from the proxied control-plane APIs.
+// This keeps presentation deployment independent of a separate frontend asset pipeline.
 func dashboard(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(page))
 }
 
+// securityHeaders wraps UI handlers with browser-oriented response hardening headers.
+// It blocks MIME sniffing and frame embedding to reduce common browser attack surfaces.
+// The wrapper adds headers before invoking the next handler without changing its routing.
+// Both static page and health responses use the same defensive defaults through this wrapper.
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")

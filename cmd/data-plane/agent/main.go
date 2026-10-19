@@ -35,7 +35,10 @@ type policyClient struct {
 	expiresAt  time.Time
 }
 
-// main starts the local flow-decision API used by platform-native adapters.
+// main starts the local flow-decision API consumed by platform-native adapters.
+// It validates required policy credentials and restricts operation to observe or enforce mode.
+// It configures the policy service location and routes health, readiness, and evaluation calls.
+// The listener on port 8082 uses bounded request and connection timeouts.
 func main() {
 	token := os.Getenv("POLICY_SERVICE_TOKEN")
 	if len(token) < 32 {
@@ -63,12 +66,18 @@ func main() {
 	log.Fatal(server.ListenAndServe())
 }
 
-// health reports that the data-plane agent is available.
+// health reports that the data-plane agent process can accept HTTP requests.
+// It deliberately avoids a policy fetch because liveness must not depend on downstream health.
+// A 204 status gives local supervisors a low-cost process health signal.
+// Callers that need usable routing decisions should use the readiness endpoint.
 func health(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// ready confirms that a policy snapshot is available before accepting flow decisions.
+// ready confirms that the agent can obtain a usable policy snapshot now.
+// It delegates to the cached snapshot loader, which refreshes expired policy when necessary.
+// Policy retrieval failure produces a 503 so orchestrators do not route traffic prematurely.
+// A 204 response means hostname evaluations can use a current or recently fetched snapshot.
 func (c *policyClient) ready(w http.ResponseWriter, r *http.Request) {
 	if _, err := c.getSnapshot(r.Context()); err != nil {
 		http.Error(w, "policy unavailable", http.StatusServiceUnavailable)
@@ -77,7 +86,10 @@ func (c *policyClient) ready(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// evaluate matches an observed hostname to policy and returns its routing action.
+// evaluate creates a flow-decision handler bound to the configured operating mode.
+// It bounds and decodes the observed hostname before obtaining a cached policy snapshot.
+// Matching rules return priority-overlay routing; unmatched names retain direct internet routing.
+// The JSON response includes policy version and mode so adapters can audit each decision.
 func (c *policyClient) evaluate(mode string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
@@ -102,7 +114,10 @@ func (c *policyClient) evaluate(mode string) http.HandlerFunc {
 	}
 }
 
-// getSnapshot returns a cached policy or fetches a fresh authenticated snapshot.
+// getSnapshot returns a non-expired policy snapshot or retrieves one from the policy service.
+// It serializes cache inspection and refresh so concurrent requests cannot stampede upstream.
+// Fresh requests use bearer authentication and reject non-success or malformed responses.
+// Successfully decoded snapshots are cached for thirty seconds before the next refresh.
 func (c *policyClient) getSnapshot(ctx context.Context) (policy.Snapshot, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

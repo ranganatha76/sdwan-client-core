@@ -44,7 +44,10 @@ type decision struct {
 
 var interfaceName = regexp.MustCompile(`^[a-zA-Z0-9_.-]{1,15}$`)
 
-// main installs routing primitives or evaluates one classified destination.
+// main parses the Linux enforcer command line and dispatches the requested root operation.
+// It loads validated root-owned configuration before install, uninstall, watch, or evaluation.
+// Mutating operations require root, while a single evaluation also validates the IPv4 input.
+// Any returned error is reported through fatal so automation receives a non-zero exit code.
 func main() {
 	configPath := flag.String("config", "/etc/pulseroute/enforcer.json", "root-owned enforcer configuration")
 	hostname := flag.String("hostname", "", "hostname associated with the destination")
@@ -89,7 +92,10 @@ func main() {
 	fatal(evaluate(context.Background(), config, *hostname, *destinationIP))
 }
 
-// loadConfig reads and validates a root-owned configuration file without secrets.
+// loadConfig reads the root-owned JSON configuration used by the enforcement adapter.
+// It unmarshals the document into Config and rejects missing or unsafe operational settings.
+// The validation happens before any OS command can consume configuration-derived arguments.
+// Successful calls return a complete configuration value without loading credentials or secrets.
 func loadConfig(path string) (Config, error) {
 	contents, err := os.ReadFile(path)
 	if err != nil {
@@ -105,12 +111,18 @@ func loadConfig(path string) (Config, error) {
 	return config, nil
 }
 
-// valid checks configuration values before they are passed to operating-system commands.
+// valid verifies every Config value that can influence routing, nftables, or tc commands.
+// It limits interface names, marks, table IDs, rates, DSCP classes, and watch intervals.
+// The rate relationship prevents a priority class from exceeding its physical link class.
+// This predicate is the first defense against unsafe command arguments from configuration.
 func (c Config) valid() bool {
 	return c.AgentURL != "" && interfaceName.MatchString(c.WireGuardDevice) && c.RouteTable > 0 && c.FirewallMark > 0 && c.LinkRateMbit > 0 && c.HighPriorityRateMbit > 0 && c.HighPriorityRateMbit <= c.LinkRateMbit && validDSCP(c.HighPriorityDSCP) && c.HealthCheckIntervalSec > 0
 }
 
-// install creates a dedicated mark, nftables destination set, and WireGuard route table.
+// install creates the nftables, policy-route, and traffic-control objects owned by PulseRoute.
+// It makes nftables setup idempotent before replacing deterministic route and QoS definitions.
+// Matching destinations receive a firewall mark that selects the dedicated WireGuard route table.
+// Any failed command stops installation and returns context needed for operational diagnosis.
 func install(ctx context.Context, config Config) error {
 	if err := ensureNftObject(ctx, []string{"table", "inet", "pulseroute"}, []string{"add", "table", "inet", "pulseroute"}); err != nil {
 		return err
@@ -143,7 +155,10 @@ func install(ctx context.Context, config Config) error {
 	return nil
 }
 
-// uninstall removes only the route and firewall objects owned by this adapter.
+// uninstall removes the nftables, QoS, policy-rule, and route-table state owned by this adapter.
+// It never deletes the WireGuard interface or modifies resources outside the PulseRoute namespace.
+// Best-effort cleanup supports fail-open behavior when an object is already absent or degraded.
+// Route-table flushing is required so marked traffic cannot continue using an old overlay route.
 func uninstall(ctx context.Context, config Config) error {
 	if runQuiet(ctx, "nft", "list", "table", "inet", "pulseroute") == nil {
 		if err := run(ctx, "nft", "delete", "table", "inet", "pulseroute"); err != nil {
@@ -160,7 +175,10 @@ func uninstall(ctx context.Context, config Config) error {
 	return nil
 }
 
-// watch maintains enforcement only while the decision agent and WireGuard interface are healthy.
+// watch continuously reconciles enforcement against agent and WireGuard health.
+// It performs an immediate reconciliation before waiting for the configured interval.
+// Context cancellation stops the ticker and returns to the caller for service shutdown.
+// Any reconciliation error is returned so the supervisor can surface an actionable failure.
 func watch(ctx context.Context, config Config) error {
 	interval := time.Duration(config.HealthCheckIntervalSec) * time.Second
 	ticker := time.NewTicker(interval)
@@ -177,7 +195,10 @@ func watch(ctx context.Context, config Config) error {
 	}
 }
 
-// reconcile installs enforcement only for a healthy agent and WireGuard device, otherwise fails open.
+// reconcile decides whether the Linux adapter should enforce or remove its routing configuration.
+// It installs only when both the local decision agent and target WireGuard device are ready.
+// If either dependency is unhealthy, it removes PulseRoute-owned state to fail open.
+// Cleanup errors are wrapped so operators can distinguish rollback failure from health loss.
 func reconcile(ctx context.Context, config Config) error {
 	if agentReady(ctx, config.AgentURL) && wireGuardReady(ctx, config.WireGuardDevice) {
 		return install(ctx, config)
@@ -188,7 +209,10 @@ func reconcile(ctx context.Context, config Config) error {
 	return nil
 }
 
-// agentReady checks the local agent's dependency-aware readiness endpoint.
+// agentReady probes the data-plane agent readiness endpoint with a short request timeout.
+// It trims a trailing URL slash so configured endpoints produce one stable readiness path.
+// Request construction, transport, and status failures all evaluate to not ready.
+// Returning a boolean lets reconcile choose fail-open cleanup without exposing probe details.
 func agentReady(ctx context.Context, agentURL string) bool {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(agentURL, "/")+"/readyz", nil)
 	if err != nil {
@@ -202,12 +226,18 @@ func agentReady(ctx context.Context, agentURL string) bool {
 	return response.StatusCode == http.StatusNoContent
 }
 
-// wireGuardReady checks that the configured WireGuard device exists and is up.
+// wireGuardReady verifies that the configured network interface exists and can be inspected.
+// It executes a fixed ip-link command without a shell or configuration-derived command syntax.
+// A non-zero command result is treated as unavailable for conservative fail-open operation.
+// The interface is not created here because tunnel lifecycle remains externally managed.
 func wireGuardReady(ctx context.Context, device string) bool {
 	return runQuiet(ctx, "ip", "link", "show", "dev", device) == nil
 }
 
-// evaluate asks the decision agent whether a destination should receive the priority mark.
+// evaluate asks the local policy agent whether one hostname and IPv4 destination needs overlay routing.
+// It posts a bounded JSON request, rejects failed agent responses, and decodes the decision.
+// Only enforce-mode overlay decisions add destinations to nftables sets, and root is required.
+// High-priority decisions additionally enter the DSCP and HTB QoS destination set.
 func evaluate(ctx context.Context, config Config, hostname, destinationIP string) error {
 	body, err := json.Marshal(flowRequest{Hostname: hostname, DestinationIP: destinationIP})
 	if err != nil {
@@ -245,27 +275,42 @@ func evaluate(ctx context.Context, config Config, hostname, destinationIP string
 	return nil
 }
 
-// shouldRoute permits operating-system route changes only for an enforce-mode overlay decision.
+// shouldRoute gates operating-system route changes on the agent's explicit enforcement decision.
+// Observe mode always returns false even when the policy would otherwise select the overlay.
+// Direct-internet decisions also return false so they never enter the nftables destination set.
+// This small predicate is the central defense against accidental routing changes in observe mode.
 func shouldRoute(result decision) bool {
 	return result.Mode == "enforce" && result.Action == "priority-overlay"
 }
 
-// shouldPrioritize limits DSCP and traffic-control priority to high-priority overlay traffic.
+// shouldPrioritize narrows QoS treatment to high-priority traffic that is already overlay eligible.
+// It delegates overlay and enforce-mode verification to shouldRoute before inspecting priority.
+// Standard-priority overlay traffic can route through the tunnel without receiving preferential QoS.
+// The result controls only DSCP and tc classification, not whether a policy route is installed.
 func shouldPrioritize(result decision) bool {
 	return shouldRoute(result) && result.Priority == "high"
 }
 
-// validDSCP restricts nftables input to the supported, safe DSCP class names.
+// validDSCP accepts only the small allowlist of DSCP classes supported by this adapter.
+// It prevents configuration text from becoming arbitrary nftables tokens or command fragments.
+// The accepted classes represent expedited, class-selector, and assured-forwarding treatment.
+// Config validation calls this predicate before installation constructs the nftables command.
 func validDSCP(value string) bool {
 	return value == "cs5" || value == "ef" || value == "af41"
 }
 
-// rate formats a positive configured link rate for tc.
+// rate formats an already-validated integer Mbps rate for the tc command-line interface.
+// It appends the unit expected by HTB rate and ceiling arguments.
+// Numeric validation is owned by Config.valid rather than repeated in this formatting helper.
+// Keeping formatting centralized makes generated traffic-control commands consistent.
 func rate(megabits int) string {
 	return fmt.Sprintf("%dmbit", megabits)
 }
 
-// validateDestinationIPv4 rejects malformed and IPv6 input because the nftables set is IPv4-only.
+// validateDestinationIPv4 accepts only syntactically valid IPv4 destination addresses.
+// It rejects malformed input and all IPv6 addresses because the managed nftables sets are IPv4-only.
+// Validation occurs before the address is included in an nftables element command.
+// Future IPv6 support requires separate set types and matching routing configuration.
 func validateDestinationIPv4(destinationIP string) error {
 	address, err := netip.ParseAddr(destinationIP)
 	if err != nil || !address.Is4() {
@@ -274,7 +319,10 @@ func validateDestinationIPv4(destinationIP string) error {
 	return nil
 }
 
-// ensureNftObject creates an nftables object only if it is not already present.
+// ensureNftObject makes an nftables table, set, or chain available without duplicating it.
+// It first executes the fixed lookup command and returns early when the object already exists.
+// Missing objects are created with the supplied fixed argument sequence and contextual errors.
+// This idempotence allows recurring health reconciliation to reuse the same installation path.
 func ensureNftObject(ctx context.Context, lookup, create []string) error {
 	if err := run(ctx, "nft", append([]string{"list"}, lookup...)...); err == nil {
 		return nil
@@ -285,7 +333,10 @@ func ensureNftObject(ctx context.Context, lookup, create []string) error {
 	return nil
 }
 
-// run invokes one fixed system command without a shell.
+// run executes one command with explicit arguments while inheriting standard output and error.
+// It avoids shell interpretation, which prevents configuration values from becoming shell syntax.
+// The supplied context cancels the subprocess when the calling operation is stopped or timed out.
+// Callers wrap its error with command-specific context when an operation cannot continue.
 func run(ctx context.Context, name string, args ...string) error {
 	command := exec.CommandContext(ctx, name, args...)
 	command.Stdout = os.Stdout
@@ -293,12 +344,18 @@ func run(ctx context.Context, name string, args ...string) error {
 	return command.Run()
 }
 
-// runQuiet invokes a fixed health-check command without emitting normal failure output.
+// runQuiet executes one fixed probe or cleanup command without forwarding normal output streams.
+// It uses the caller's context and avoids a shell for the same command-injection boundary as run.
+// Non-zero status is returned to the caller but does not pollute normal watchdog logs.
+// Health checks and best-effort cleanup use this quieter execution path intentionally.
 func runQuiet(ctx context.Context, name string, args ...string) error {
 	return exec.CommandContext(ctx, name, args...).Run()
 }
 
-// fatal exits only when a command reports an error.
+// fatal reports a non-nil command error with the enforcer prefix and exits unsuccessfully.
+// A nil error returns immediately so main can use it uniformly after each command dispatch.
+// Reporting to standard error keeps stdout available for future machine-readable commands.
+// The non-zero exit code lets systemd and shell automation detect failed enforcement operations.
 func fatal(err error) {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "pulseroute-enforcer:", err)

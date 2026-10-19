@@ -14,6 +14,10 @@ type Snapshot struct {
 	Rules   []Rule `json:"rules"`
 }
 
+// DefaultSnapshot returns the versioned built-in policy used when no remote policy exists.
+// It defines high-priority SaaS destinations needed by remote business workflows.
+// Each rule uses suffix domains so subdomains inherit the parent application's policy.
+// Consumers treat the version as an audit field and cache key for decision consistency.
 func DefaultSnapshot() Snapshot {
 	return Snapshot{
 		Version: "2026-10-19.1",
@@ -28,6 +32,10 @@ func DefaultSnapshot() Snapshot {
 	}
 }
 
+// Match resolves a hostname to the first matching rule in this policy snapshot.
+// It normalizes letter case, surrounding spaces, and a trailing DNS root dot first.
+// Exact domains and subdomains match, while unrelated lookalike suffixes do not.
+// A false result returns the zero Rule so callers can retain their direct-routing default.
 func (s Snapshot) Match(hostname string) (Rule, bool) {
 	hostname = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(hostname), "."))
 	for _, rule := range s.Rules {

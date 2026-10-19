@@ -65,7 +65,10 @@ type server struct {
 	metricsClient *http.Client
 }
 
-// main starts the local dashboard and registers its control-plane HTTP APIs.
+// main constructs the in-memory control-plane state used by the local dashboard.
+// It reads the optional metrics service URL and configures a bounded HTTP client.
+// It registers health, state, policy, optimization, and measurement endpoints.
+// It then starts the listener that serves the control-plane API on port 8080.
 func main() {
 	s := &server{
 		state:         initialState(),
@@ -86,12 +89,18 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8080", mux))
 }
 
-// health reports that the control-plane process can accept requests.
+// health provides a lightweight liveness endpoint for the control-plane process.
+// It performs no state lookup because liveness only proves the process is running.
+// A successful response is intentionally empty to minimize probe work and payload.
+// Orchestrators can use the 204 status to decide whether the service accepts requests.
 func health(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// initialState creates the dashboard's default protected applications and paths.
+// initialState creates the dashboard's deterministic starting state for a new process.
+// It defines the work applications that are eligible for priority path selection.
+// It also supplies fixture path qualities until a native probe reports fresh samples.
+// The returned value is independent state that can be safely owned by one server.
 func initialState() clientState {
 	// These defaults represent the centrally distributed work-traffic policy.
 	return clientState{
@@ -125,7 +134,10 @@ func initialState() clientState {
 	}
 }
 
-// getState returns a consistent snapshot for the dashboard to render.
+// getState returns the current dashboard model as a consistent JSON snapshot.
+// It holds a read lock so callers cannot observe a partially updated route decision.
+// The encoder writes the state directly without exposing the server's mutex.
+// Browser refreshes use this endpoint to render paths, policies, and recent activity.
 func (s *server) getState(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -133,13 +145,19 @@ func (s *server) getState(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(s.state)
 }
 
-// dashboard serves the embedded browser UI.
+// dashboard serves the legacy embedded browser interface from the control-plane binary.
+// It sets an HTML content type so browsers render the page rather than download it.
+// The page is static; its JavaScript reads live state through the JSON API.
+// The separate UI service is the normal container-facing browser endpoint.
 func (s *server) dashboard(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(page))
 }
 
-// togglePolicy enables or disables one application's priority routing policy.
+// togglePolicy flips the priority-routing state for the application named in the URL.
+// It updates priority, health, and route fields while holding the state write lock.
+// Enabling follows the currently selected path; disabling restores direct internet.
+// Unknown application identifiers receive a standard 404 response without mutation.
 func (s *server) togglePolicy(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/policies/"), "/toggle")
 	s.mu.Lock()
@@ -165,7 +183,10 @@ func (s *server) togglePolicy(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 
-// enableAllPolicies restores high-priority protection for every known application.
+// enableAllPolicies reactivates priority routing for every configured application.
+// It applies the currently selected path consistently to each restored policy.
+// The update and corresponding activity event are performed under one write lock.
+// The resulting full state is returned so the UI can redraw without another request.
 func (s *server) enableAllPolicies(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -182,7 +203,10 @@ func (s *server) enableAllPolicies(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, s.state)
 }
 
-// optimize applies the most recently reported measurements to protected routes.
+// optimize reapplies the latest path ranking to all active application policies.
+// It does not generate measurements; it only uses values already stored in state.
+// A write lock protects selection flags and application route updates as one action.
+// The endpoint returns the resulting state for immediate dashboard feedback.
 func (s *server) optimize(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -190,7 +214,10 @@ func (s *server) optimize(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, s.state)
 }
 
-// recordPathMeasurements accepts current link-quality samples and immediately updates routing.
+// recordPathMeasurements accepts one complete, current set of probe quality samples.
+// It caps the request size, validates the payload, and replaces path values atomically.
+// Successful samples are ranked immediately before a response snapshot is captured.
+// Metric forwarding runs asynchronously so storage latency cannot delay route selection.
 func (s *server) recordPathMeasurements(w http.ResponseWriter, r *http.Request) {
 	var measurements []pathMeasurement
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<10))
@@ -213,7 +240,10 @@ func (s *server) recordPathMeasurements(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, state)
 }
 
-// applyPathMeasurements validates a full probe cycle before replacing displayed path quality.
+// applyPathMeasurements validates and applies exactly one sample for every configured path.
+// It rejects missing, duplicate, unknown, stale-shaped, or out-of-range measurements.
+// Valid samples update displayed quality and derive the bounded routing score per path.
+// It records the latest sample time only after the complete cycle has been accepted.
 func (s *server) applyPathMeasurements(measurements []pathMeasurement) error {
 	if len(measurements) != len(s.state.Paths) {
 		return fmt.Errorf("expected measurements for all %d configured paths", len(s.state.Paths))
@@ -245,7 +275,10 @@ func (s *server) applyPathMeasurements(measurements []pathMeasurement) error {
 	return nil
 }
 
-// selectBestPath ranks the latest reported quality values and steers protected traffic.
+// selectBestPath marks the highest-scoring path as selected using current measurements.
+// It updates only active applications, preserving direct routing for disabled policies.
+// The caller controls whether a human-readable optimization event is added.
+// It assumes its caller already holds the write lock that protects shared state.
 func (s *server) selectBestPath(recordActivity bool) {
 	bestIndex := selectBestPath(s.state.Paths)
 	for index := range s.state.Paths {
@@ -270,7 +303,10 @@ type performanceMeasurement struct {
 	BandwidthBytes     int64   `json:"bandwidthBytes"`
 }
 
-// reportPathMetrics sends probe-derived application metrics without blocking route selection.
+// reportPathMetrics publishes per-application probe results to the optional metrics service.
+// It uses direct internet as a baseline and the selected path as the optimized result.
+// Failures are logged per application so one failed write does not stop later writes.
+// Callers run it after releasing state locks because observability must not block routing.
 func (s *server) reportPathMetrics(state clientState) {
 	if s.metricsURL == "" || s.metricsClient == nil {
 		return
@@ -322,7 +358,10 @@ func (s *server) reportPathMetrics(state clientState) {
 	}
 }
 
-// pathByName returns the requested configured path, or the current selection as a safe fallback.
+// pathByName locates a configured path by its stable display name.
+// It returns a value copy so callers cannot modify the server's shared path slice.
+// When a named baseline is absent, it falls back to the currently selected path.
+// This keeps metrics reporting available if an administrator changes path definitions.
 func pathByName(paths []path, name string) path {
 	for _, candidate := range paths {
 		if candidate.Name == name {
@@ -332,12 +371,18 @@ func pathByName(paths []path, name string) path {
 	return selectedPath(paths)
 }
 
-// lossPercent parses the display loss value used by the control-plane API.
+// lossPercent converts the dashboard's percent-formatted loss string to a number.
+// It removes the presentation suffix before delegating numeric validation to strconv.
+// The returned error lets callers avoid reporting corrupted or incompatible metrics.
+// This adapter exists because the dashboard state stores loss in a display-friendly form.
 func lossPercent(value string) (float64, error) {
 	return strconv.ParseFloat(strings.TrimSuffix(value, "%"), 64)
 }
 
-// selectBestPath returns the index of the highest-scoring current measurement.
+// selectBestPath returns the index of the highest-scoring entry in a path slice.
+// It preserves the first path as the tie winner, producing deterministic selection.
+// Callers use the index to synchronize selected flags and active application routes.
+// The function expects a non-empty slice, as guaranteed by the configured state.
 func selectBestPath(paths []path) int {
 	bestIndex := 0
 	for index := 1; index < len(paths); index++ {
@@ -348,7 +393,10 @@ func selectBestPath(paths []path) int {
 	return bestIndex
 }
 
-// toggleConnection pauses or resumes the dashboard's protection state.
+// toggleConnection flips the dashboard-wide protection indicator for the client.
+// It serializes the state update and activity feed insertion with the write lock.
+// This prototype state does not itself reconfigure operating-system packet routing.
+// The updated state is returned so the UI can immediately reflect the new mode.
 func (s *server) toggleConnection(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -361,7 +409,10 @@ func (s *server) toggleConnection(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, s.state)
 }
 
-// addActivity prepends a bounded audit event to the dashboard activity feed.
+// addActivity prepends a timestamped event to the in-memory dashboard activity feed.
+// It retains only the newest four events to keep snapshots compact and predictable.
+// Callers must hold the server write lock because it mutates the shared state slice.
+// Event kinds allow the browser to style successful, neutral, and warning decisions.
 func (s *server) addActivity(message, kind string) {
 	s.state.Activity = append([]activity{{Time: time.Now().Format("15:04"), Message: message, Kind: kind}}, s.state.Activity...)
 	if len(s.state.Activity) > 4 {
@@ -369,7 +420,10 @@ func (s *server) addActivity(message, kind string) {
 	}
 }
 
-// selectedPath returns the path currently chosen for priority traffic.
+// selectedPath finds the path currently marked for priority traffic in a path slice.
+// It returns a value copy, avoiding external mutation of the selection state.
+// If no path is marked, the first configured path acts as the stable fallback.
+// The configuration always contains paths, so callers do not need an error result.
 func selectedPath(paths []path) path {
 	for _, path := range paths {
 		if path.Selected {
@@ -379,7 +433,10 @@ func selectedPath(paths []path) path {
 	return paths[0]
 }
 
-// writeJSON serializes API responses with the expected content type.
+// writeJSON serializes an API response as JSON with the matching media type header.
+// It centralizes the response format used by state-changing control-plane handlers.
+// Encoding errors are ignored because all call sites supply in-memory serializable values.
+// The helper keeps handlers focused on authorization, mutation, and error decisions.
 func writeJSON(w http.ResponseWriter, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(value)
