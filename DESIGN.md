@@ -458,12 +458,245 @@ sequenceDiagram
 
 The dashboard does not prove an overlay benefit by itself. Measurements must compare equivalent workloads and time windows, and the adapter must record both direct-path baseline and overlay-path values before any performance claim is made.
 
-## Production Readiness Roadmap
+## Production Target Architecture
 
-1. Replace static policy data with signed, versioned, remotely managed policies.
-2. Add mutual TLS or per-device credentials for services and gateway.
-3. Deliver an authenticated, health-checked WireGuard gateway configuration and an authoritative DNS/SNI flow collector for the Linux enforcer.
-4. Build, sign, and distribute the macOS Packet Tunnel and Windows Filtering Platform adapters.
-5. Add durable state, audit logs, Grafana provisioning, alerts, and dashboards.
-6. Add Linux integration tests for policy refresh, WireGuard loss, fail-open, upgrades, rollback, and DSCP/HTB behavior.
-7. Add pinned image digests, vulnerability scans, SBOMs, image signing, and CI release artifacts.
+This section describes the target architecture required to operate PulseRoute as a paid, organization-managed service. It is a design target, not a statement that the components below are implemented in this repository. The current implementation remains a Linux-first prototype with a local, in-memory control plane and a fail-open enforcer.
+
+The production service has three administrative planes with deliberately separate trust boundaries:
+
+| Plane | Responsibility | Trust boundary |
+| --- | --- | --- |
+| Endpoint plane | Classify approved destinations, enforce local policy, measure health, and preserve user connectivity during failures. | A device-specific identity and least-privileged root service. |
+| Customer control plane | Manage tenants, devices, policies, gateways, rollout state, audit records, and support access. | Strong tenant isolation, authenticated operators, and signed policy publication. |
+| Gateway data plane | Terminate managed overlays and forward only traffic that a customer policy authorizes. | Per-tenant gateway credentials, restrictive forwarding, egress controls, and operational monitoring. |
+
+```mermaid
+flowchart TB
+  Admin[Customer administrator] --> Portal[Customer control plane]
+  Portal --> Policy[Versioned signed policy service]
+  Portal --> Enroll[Device enrollment service]
+  Portal --> GatewayAPI[Gateway configuration service]
+  Device[Managed endpoint] -->|mTLS| Enroll
+  Device -->|mTLS policy fetch| Policy
+  Device -->|WireGuard or approved VPN overlay| Gateway[Regional gateway]
+  Gateway --> SaaS[Approved SaaS and private applications]
+  Device --> Telemetry[Telemetry ingestion]
+  Gateway --> Telemetry
+  Telemetry --> Store[(Tenant-scoped telemetry store)]
+  Portal --> Store
+```
+
+The control plane must be reachable independently of the selected data path. Bootstrap access to enrollment, identity, DNS, time synchronization, device management, gateway endpoints, and emergency support must not depend on a policy route that could prevent its own recovery.
+
+### Production Invariants
+
+The following invariants are required before a tenant is placed in enforce mode:
+
+- A device receives policy only after mutual authentication and authorization for its tenant, user or device group, and rollout cohort.
+- Every policy decision is traceable to an immutable policy version, device identity, gateway selection, and timestamp.
+- Gateway forwarding is deny-by-default. A gateway accepts traffic only from enrolled peers and forwards only destinations and ports permitted by the tenant policy.
+- The endpoint never exposes a private key, enrollment token, refresh token, or administrative credential through the dashboard, telemetry, process arguments, or application logs.
+- A failed update, stale policy, unavailable gateway, or failed health check moves the device to its documented failure mode without leaving ambiguous routing state.
+- Tenant data, credentials, policies, audit records, and telemetry are logically isolated and access is checked on every request, not inferred from a client-supplied tenant identifier.
+- Observability must distinguish measured facts from policy intent. A selected path is not evidence of an improvement unless equivalent direct and overlay measurements support that conclusion.
+
+## Device Identity and Enrollment
+
+### Enrollment Flow
+
+Each managed endpoint requires a stable device record and a device-bound credential. Enrollment must use a single-use bootstrap mechanism issued by the customer administrator or device-management platform. Suitable bootstrap mechanisms include a short-lived enrollment token delivered by MDM, a workload identity from the organization's device-management system, or a customer-managed certificate authority. A shared tenant-wide secret is not sufficient.
+
+1. An administrator creates an enrollment invitation scoped to one tenant, an allowed device group, a maximum device count, expiry, and permitted enrollment method.
+2. The installer obtains the invitation through MDM or an authenticated setup flow and exchanges it over TLS for a device certificate and short-lived enrollment session.
+3. The endpoint generates its WireGuard private key locally in a root-readable-only location. The private key never enters the control plane after generation.
+4. The endpoint submits its public key and an attestation of its software version and platform. The control plane creates a device record and assigns a tunnel address from a tenant-scoped address pool.
+5. The control plane returns a signed bootstrap policy, selected gateway metadata, certificate chain, policy endpoint, and rotation deadlines.
+6. The endpoint verifies signatures and stores only the minimum local state required to reconnect. It then replaces the one-time enrollment material.
+
+The enrollment service must rate-limit attempts, record all successful and failed enrollment events, and revoke invitations after use or expiry. Administrators need the ability to quarantine, revoke, and re-enroll a device without changing credentials for other devices.
+
+### Credential and Key Lifecycle
+
+- Use separate credentials for device API access and WireGuard peer authorization. Compromise of one must not authorize the other.
+- Device certificates should be short-lived and automatically renewed before expiry using the existing device identity. Renewal failures must be visible before the certificate expires.
+- Rotate WireGuard peer keys on a scheduled cadence and immediately on device compromise, tenant offboarding, or gateway migration. Support overlapping old/new peer records during rotation to avoid a connectivity interruption.
+- Store private keys in an OS-supported protected store where available; otherwise use a root-owned directory with mode `0700` and key files with mode `0600`.
+- Never use long-lived bearer tokens in an endpoint configuration file. Any bootstrap token must expire quickly, be single-use, and be redacted from logs.
+
+## Policy Management and Flow Classification
+
+### Signed, Versioned Policy
+
+Production policy replaces the static Go data with a signed immutable document. Each document includes a tenant ID, policy ID, monotonically increasing version, issue and expiry times, destination rules, gateway eligibility, traffic priority, failure-mode assignment, and a signature from an offline or tightly controlled signing key.
+
+The endpoint accepts a policy only when all of the following checks succeed:
+
+1. The transport is mutually authenticated and the server identity matches the configured service authority.
+2. The policy tenant and device or group scope matches the enrolled endpoint.
+3. The signature chains to a trusted policy signing key and the policy is within its validity window.
+4. The version is newer than, or explicitly authorized as a rollback of, the persisted accepted version.
+5. Destination, port, expiry, and resource limits pass strict local validation.
+
+Policies must be published atomically and retain a rollback history. Operators may roll back only to a previously signed version, and the audit event must identify the actor, reason, affected cohort, old version, and new version. A policy rollout must support explicit cohorts: internal, canary, early adopter, and general availability. A tenant administrator must be able to pause or reverse a rollout without a code deployment.
+
+### Destination Mapping
+
+The production Linux collector must be authoritative for the mappings it contributes. It may use an approved DNS observation source, application integration, or TLS SNI metadata where lawful and technically reliable. It must not infer a hostname from raw destination IP ownership or route unknown traffic based on a public ASN lookup.
+
+Each mapping must contain the policy rule, IP address family, observed time, bounded expiry, source type, and correlation identifier. The collector must remove mappings when they expire, no longer match policy, or have been superseded. Shared CDN addresses are routed only when the customer has explicitly accepted that risk and the policy supports the needed precision. IPv6 must be designed and tested before it is advertised as supported; silently bypassing it creates a policy gap.
+
+The first production release should limit routing to explicit customer-approved hostname suffixes and destination ports, use conservative TTLs, and report ambiguous mappings rather than routing them. It must retain the current privacy boundary: no packet payload collection, browser history, or unrestricted DNS history.
+
+## Gateway Data Plane
+
+### Gateway Responsibilities
+
+A production gateway is a managed service, not an endpoint configuration detail. It terminates authorized device tunnels, verifies peer authorization, applies tenant egress policy, provides a stable return path, emits operational telemetry, and forwards approved traffic through the selected regional egress. It does not inspect application payloads by default and it must not become an unrestricted consumer VPN exit node.
+
+Every gateway region requires:
+
+- An isolated gateway pool per environment, with production separate from test and staging.
+- Tenant-scoped WireGuard peer records, tunnel address pools, and firewall rules.
+- IP forwarding, strict reverse-path behavior appropriate to tunnel routing, source NAT or explicit return routes, and deny-by-default forwarding.
+- Egress ACLs for approved destinations and ports, DNS resolver policy, logging controls, and abuse protections.
+- At least two healthy gateway instances in separate failure domains before offering a regional availability objective.
+- Capacity limits for peer count, packets per second, encrypted throughput, conntrack entries, and egress bandwidth, with alerts before saturation.
+
+Gateway provisioning must be declarative and reconciled from a reviewed configuration source. Manual firewall, peer, and route changes are emergency-only, time-bounded, audited, and reconciled back into the declared state. Gateway credentials and peer changes must never be managed through the customer dashboard directly.
+
+### Gateway Selection and Health
+
+The endpoint may select only gateways authorized by its signed policy. Selection should consider active probe results, WireGuard handshake freshness, loss, jitter, gateway capacity, regional availability, and policy constraints. A gateway interface existing locally is not a health signal.
+
+Healthy means all of the following are true:
+
+- The WireGuard peer completed a recent handshake within a configured bounded age.
+- An active encrypted-path probe reaches the gateway or a gateway-controlled probe target.
+- The gateway reports sufficient capacity and a valid configuration generation.
+- The endpoint has a current signed policy that authorizes the gateway.
+
+Failover must use hysteresis and a minimum dwell time to prevent route flapping. The service should record both the candidate scores and the reason a gateway was selected or rejected. Operators must be able to pin a device or cohort to a gateway for incident mitigation.
+
+## Failure Modes and Emergency Access
+
+### Fail-Open Default
+
+The existing Linux behavior is fail-open and remains the default for early deployments. When the agent, policy, or overlay is unhealthy, PulseRoute-owned packet state is removed and traffic follows the operating system's normal route. This is appropriate when the overlay is an optimization feature and direct access is permitted by the organization's VPN/SSE policy.
+
+### Fail-Closed Is an Opt-In Security Policy
+
+Fail-closed behavior must never be enabled merely by changing a global default. It requires a separate, customer-approved policy assignment, documented user impact, canary validation, and an emergency rollback procedure. A fail-closed device should block only the explicitly protected destination classes when its authorized tunnel is unhealthy; it must not indiscriminately block all endpoint connectivity.
+
+The protected bootstrap allowlist must be customer-specific and versioned with the policy. It normally includes the selected gateway endpoints, DNS resolvers, identity provider and MFA endpoints, certificate revocation or OCSP endpoints where required, device management, time synchronization, policy/enrollment services, and emergency support resources. Allowlist entries should be stable FQDNs resolved through trusted sources or tightly scoped IP ranges, never broad public-cloud prefixes.
+
+Before enabling fail-closed for a cohort, test at minimum:
+
+1. Gateway loss, tunnel handshake expiry, and restored gateway behavior.
+2. Policy-service and DNS unavailability.
+3. Endpoint reboot, upgrade interruption, and clock skew.
+4. Certificate and key rotation while a protected session is active.
+5. Emergency disable through MDM or locally authenticated break-glass recovery.
+6. Behavior for IPv4, IPv6, captive portals, and local-network exceptions.
+
+The controller must make the effective failure mode visible to the user and administrator. It must produce an audit record whenever a device enters or exits restricted mode, including the health signal and the policy version responsible.
+
+## Control Plane, Data Stores, and Administration
+
+The prototype's in-memory state must be replaced by durable, backed-up stores. A relational system of record should hold tenant configuration, users, roles, devices, gateway inventory, policies, policy assignments, rollout cohorts, invitations, revocations, and immutable audit records. A time-series store should hold bounded telemetry and should not be used as the authorization source of truth.
+
+Every control-plane API must derive the tenant from a validated identity or server-side session. It must enforce role-based access control for at least tenant administrator, network operator, support operator, read-only analyst, and automation identity. Support access must be time-bound, tenant-approved where contractually required, and fully audited. Do not place customer-wide administration and tenant administration behind the same unrestricted role.
+
+Audit records should capture authentication events, administrator actions, enrollment, policy signing and publication, policy assignment, gateway changes, access grants, support impersonation, device revocation, and break-glass use. They must be append-only from the application's perspective, retained according to the customer agreement, searchable by tenant and correlation ID, and exported to the customer's SIEM where required.
+
+## Observability, SLOs, and Privacy
+
+### Operational Signals
+
+Production monitoring needs separate endpoint, gateway, and control-plane signals:
+
+| Surface | Required signals |
+| --- | --- |
+| Endpoint | Agent availability, policy freshness, accepted policy version, tunnel status, handshake age, active probe result, route changes, collector health, and local enforcement error count. |
+| Gateway | Peer count, handshakes, encrypted throughput, egress throughput, packet drops, conntrack utilization, CPU, memory, disk, configuration generation, and probe success. |
+| Control plane | Enrollment success, policy publication latency, policy-fetch success, authentication failures, API latency/error rate, queue depth, database health, signature verification failures, and audit-write failures. |
+
+Set initial service objectives only after collecting a representative pilot baseline. Candidate objectives include control-plane availability, policy publication latency, gateway regional availability, successful endpoint policy refresh, and bounded mean time to detect and restore a regional gateway failure. Application improvement is a product outcome, not a platform availability SLO, and must be reported only from verified measurement methodology.
+
+### Privacy and Data Retention
+
+Collect the minimum information needed to operate the service. Device identity, coarse network health, policy version, gateway selection, and aggregate performance are sufficient for the initial service. Packet payloads, browsing history, unrestricted DNS logs, keystrokes, process command lines, and user content are out of scope.
+
+Define retention separately for audit records, support diagnostics, operational metrics, and customer-visible performance reports. Retention, deletion, export, encryption, subprocessor use, and regional data residency must be contractually documented before customer production traffic is accepted. Access to raw operational data must be logged and restricted by tenant.
+
+## Secure Delivery and Endpoint Lifecycle
+
+### Release Pipeline
+
+Every release must be reproducible from a tagged source revision. Build artifacts should include SBOMs, signed checksums, provenance attestations, vulnerability scan results, and a signed release manifest. Container images must use pinned base-image digests, run as non-root, and be signed before publication. Production deployments verify image and artifact signatures before promotion.
+
+The endpoint installer requires a signed package, an upgrade-safe service definition, a migration strategy for local state, and an uninstall path that removes only PulseRoute-owned network state. Automatic updates should use staged cohorts and support rollback to the last known-good version. An update failure must not strand a user in fail-closed mode or leave a stale nftables policy active.
+
+### Security Engineering
+
+Before general availability, complete threat modeling and independent security testing for enrollment, certificate issuance, policy signing, gateway isolation, local privilege boundaries, Linux packet enforcement, update verification, support access, and multi-tenant APIs. Establish a vulnerability intake and patch-SLA process, dependency scanning, secret scanning, incident response runbooks, on-call ownership, and regular access reviews.
+
+No public production claim should be made for a platform until that platform has its own signed installer, update path, support playbook, and end-to-end enforcement tests. The current product claim must remain Linux-first; macOS and Windows are separate delivery programs.
+
+## Validation and Rollout Plan
+
+### Test Strategy
+
+The production test suite must extend beyond unit tests:
+
+- Linux network-namespace integration tests for policy installation, expiry, refresh, gateway failover, direct-path fallback, fail-closed protection, IPv4 and IPv6 behavior, DSCP/HTB classification, and uninstall cleanup.
+- Contract tests for enrollment, certificate renewal, signed policy verification, policy rollback, device revocation, and tenant authorization boundaries.
+- Gateway integration tests for peer isolation, forwarding ACLs, NAT/return paths, capacity limits, and configuration reconciliation.
+- Chaos and recovery tests for gateway loss, control-plane loss, database failover, clock skew, DNS failure, bad policy publication, interrupted endpoint upgrade, and regional evacuation.
+- Load and soak tests for expected peer counts, policy fan-out, telemetry ingestion, gateway throughput, and long-lived collaboration sessions.
+- Security tests including dependency vulnerability scanning, static analysis, image scanning, secrets detection, fuzzing of untrusted policy and telemetry parsers, and an external penetration test before general availability.
+
+### Staged Customer Rollout
+
+1. Run an internal dogfood cohort in observe mode. Verify endpoint installation, policy accuracy, telemetry quality, privacy controls, support workflows, and gateway capacity.
+2. Run a design-partner pilot with ten to twenty-five managed Linux devices and one or two explicitly approved application groups. Keep the default failure mode fail-open.
+3. Compare matched direct and overlay measurements over equivalent time windows. Publish no savings or quality claim without retained source measurements and a documented comparison method.
+4. Expand to a controlled paid cohort only after enrollment, key rotation, gateway failover, policy rollback, incident response, and support escalation exercises succeed.
+5. Enable fail-closed only for customers and destination classes that completed the dedicated acceptance tests and approved the bootstrap allowlist.
+6. Promote to general availability only after multi-tenant isolation, operational SLOs, release controls, legal/privacy documentation, and platform support obligations are in place.
+
+Each phase must define entry criteria, exit criteria, owner, rollback action, and a customer communication plan. Metrics that trigger rollback should be declared before rollout, such as elevated tunnel failure rate, policy-fetch error rate, support tickets per active device, route flapping, or verified application regression.
+
+## Commercialization Model
+
+PulseRoute should be sold initially as a managed remote-connectivity optimization service for customers that permit an approved overlay and can identify a small set of performance-sensitive SaaS or private applications. It should not be marketed as a VPN bypass, a security-service replacement, or a guarantee that every application will improve.
+
+### Initial Paid Offer
+
+The first commercial offer should be a time-bounded paid pilot with a clear operational scope:
+
+- A defined Linux endpoint cohort, one or more gateway regions, and named supported application classes.
+- Customer-owned identity, device-management, and approved split-routing or overlay authorization.
+- Baseline and post-rollout measurement plan, including the selected metrics, sample window, and success thresholds.
+- Named support contacts, an escalation path, maintenance window, data-retention terms, and a documented rollback procedure.
+- A per-managed-device subscription with a separately priced gateway, support, or reserved-capacity component when applicable.
+
+Commercial success should be evaluated using deployment completion, active protected devices, gateway reliability, support burden, and verified application-experience outcomes. Do not use synthetic dashboard data, raw policy-selection counts, or manually seeded "avoided incidents" as revenue or customer-value evidence.
+
+### Packaging and Service Boundaries
+
+Package tiers should correspond to real operating cost and support commitments, for example an assisted pilot, a managed production tier, and an enterprise tier with regional gateway options, SIEM export, SSO/RBAC integration, and contracted support objectives. Pricing must account for gateway egress, regional redundancy, telemetry storage, support staffing, and security/compliance operations rather than only endpoint-agent distribution.
+
+Customer responsibilities must be explicit: approving split-tunnel behavior, administering users and devices, supplying destination policy intent, validating application outcomes, and maintaining their identity/device-management systems. PulseRoute responsibilities must be equally explicit: service operation, endpoint and gateway updates, policy delivery, documented incident response, telemetry retention according to agreement, and support within the purchased tier.
+
+## Production Readiness Exit Criteria
+
+PulseRoute is ready for a production customer only when all applicable criteria are met:
+
+1. A tenant-isolated control plane, durable audit trail, RBAC, and authenticated device enrollment are operating with backup and recovery tests.
+2. Endpoint credentials, policy signatures, WireGuard peer lifecycle, gateway authorization, and secret rotation are implemented and independently reviewed.
+3. At least one resilient gateway region has automated provisioning, restrictive forwarding, capacity monitoring, tested failover, and an on-call operational owner.
+4. Linux endpoint enforcement has authoritative destination mapping, active overlay-health validation, safe expiry and cleanup, signed updates, and end-to-end integration coverage.
+5. The selected failure mode, bootstrap allowlist, emergency recovery process, and customer impact are documented and tested for every enforce-mode cohort.
+6. Release artifacts are signed, traceable, scanned, and reversible; endpoint and gateway updates have staged deployment and rollback procedures.
+7. Privacy, data retention, support, incident response, and customer security documentation are approved for the target market.
+8. A paid pilot demonstrates outcomes with real measurements and no unresolved high-severity security, availability, or data-isolation finding.

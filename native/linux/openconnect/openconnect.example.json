@@ -1,0 +1,9 @@
+{
+  "protocol": "anyconnect",
+  "gateway": "https://vpn.example.com",
+  "interface": "pr-vpn0",
+  "authGroup": "",
+  "username": "",
+  "serverCertificate": "",
+  "pidFile": "/run/pulseroute/openconnect.pid"
+}

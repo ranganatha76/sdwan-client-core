@@ -41,6 +41,47 @@ sudo systemctl enable --now pulseroute-enforcer
 
 The watchdog runs the rollback when the WireGuard device or local agent is unavailable. It checks device availability only; configure WireGuard `PersistentKeepalive` and external gateway health monitoring for stronger peer-path detection. An authoritative DNS/SNI flow collector is not implemented yet.
 
+### Real-time path probe
+
+`linux/path-probe` is a Linux-only command that measures administrator-approved targets through explicitly named local interfaces and posts one complete quality cycle to the local control plane. The control plane then scores the live measurements and updates the selected path for active policies. It does not change routes, create tunnels, inspect traffic, or discover application destinations.
+
+Build it on Linux, then use path names that exactly match the control-plane configuration:
+
+```sh
+go build -o pulseroute-path-probe ./native/linux/path-probe
+./pulseroute-path-probe \
+	--path 'Fiber primary,wlan0,198.51.100.10' \
+	--path 'LTE failover,wwan0,198.51.100.20' \
+	--path 'Direct internet,wlan0,203.0.113.10' \
+	watch
+```
+
+Each `--path` value is `name,interface,target`. The target stays local command configuration and is not sent to the control-plane API or stored in telemetry. A cycle is rejected if it does not contain all configured path names, so a deployment must update the probe configuration together with the control-plane path policy. The command uses Linux `ping -I` and therefore needs permission to send ICMP probes; grant only the minimum capability or run it through an approved service manager.
+
+### OpenConnect-compatible VPN adapter
+
+`linux/openconnect` is an optional Linux adapter for VPN gateways that the organization explicitly authorizes for the open-source [OpenConnect](https://www.infradead.org/openconnect/) client. It supports OpenConnect's `anyconnect` protocol for Cisco AnyConnect-compatible gateways and its `gp` protocol for Palo Alto GlobalProtect-compatible gateways. It does not control the vendor's installed client, select vendor-managed gateways, or support Zscaler.
+
+The adapter launches the system `openconnect` binary, maintains a managed tunnel interface, reports process/interface status, and requests a clean `SIGTERM` disconnect. Authentication remains interactive in OpenConnect or is supplied by an organization-managed mechanism. PulseRoute never accepts, stores, logs, or passes passwords, cookies, MFA values, private keys, or token secrets.
+
+Build and install the command on an authorized Linux endpoint:
+
+```sh
+go build -o pulseroute-openconnect ./native/linux/openconnect
+sudo install -o root -g root -m 0755 pulseroute-openconnect /usr/local/sbin/
+sudo install -o root -g root -m 0600 native/linux/openconnect/openconnect.example.json /etc/pulseroute/openconnect.json
+```
+
+Edit the root-owned configuration with the approved HTTPS gateway, supported protocol, tunnel interface, optional username/authentication group, optional certificate pin, and PID path. The configuration must remain root-owned with mode `0600` or stricter and its PID file must stay under `/run/pulseroute/`.
+
+```sh
+sudo /usr/local/sbin/pulseroute-openconnect connect
+sudo /usr/local/sbin/pulseroute-openconnect status
+sudo /usr/local/sbin/pulseroute-openconnect disconnect
+```
+
+`connect` prompts through the invoking terminal when the gateway requires credentials or MFA. Test only against a gateway and account you own or are explicitly authorized to use. GlobalProtect support in OpenConnect is protocol-compatible rather than a substitute for every vendor feature such as device posture checks or all SSO flows.
+
 ### Endpoint telemetry collector
 
 `linux/telemetry` is an independent, observe-only Linux command. It does not invoke the enforcer or modify routes, QoS, WireGuard, DNS, or firewall state. It reports coarse local metadata: active interface category and changes, VPN-interface availability, default-route availability, aggregate CPU load and available memory, optional Wi-Fi signal strength, optional DNS/TLS reachability, and optional ICMP loss/latency/jitter.

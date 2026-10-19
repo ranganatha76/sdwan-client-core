@@ -1,5 +1,9 @@
 
 The dashboard starts in a pending-measurement state and refuses optimization until it accepts one complete path-probe cycle. It does not publish route-performance telemetry from the former fixture values, so Grafana improvement panels represent accepted probe data rather than dashboard defaults.
+
+For a real Linux endpoint, use the [native real-time path probe](native/README.md#real-time-path-probe) to measure approved targets on each configured underlay and continuously feed the control plane. It provides live path scoring only; automatic application flow discovery and production tunnel provisioning remain separate components.
+
+For organizations that authorize OpenConnect, the [Linux OpenConnect adapter](native/README.md#openconnect-compatible-vpn-adapter) can manage an OpenConnect-compatible Cisco AnyConnect or Palo Alto GlobalProtect tunnel without storing authentication secrets. It does not support Zscaler or control a vendor-installed VPN client.
 # PulseRoute SD-WAN Client
 
 PulseRoute is a lightweight Go prototype for a laptop SD-WAN client control plane. It presents routing health, prioritizes business and productivity applications, and lets a user simulate route optimization from a local web dashboard.
