@@ -5,6 +5,11 @@ services:
       dockerfile: deploy/Dockerfile
       args:
         TARGET: ./cmd/control-plane
+    environment:
+      METRICS_URL: http://metrics-server:8083
+    depends_on:
+      metrics-server:
+        condition: service_healthy
     expose:
       - "8080"
     healthcheck:

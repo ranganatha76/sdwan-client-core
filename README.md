@@ -80,7 +80,8 @@ docker compose -f deploy/docker-compose.yml down
 | `GET` | `/api/state` | Read connection, application, path, and activity state. |
 | `POST` | `/api/policies/{id}/toggle` | Enable or disable one application priority policy. |
 | `POST` | `/api/policies/enable-all` | Enable every configured application policy at high priority. |
-| `POST` | `/api/optimize` | Re-score paths and steer active applications to the best route. |
+| `POST` | `/api/paths/measurements` | Submit a full timestamped probe cycle; score paths and steer active applications to the best route. |
+| `POST` | `/api/optimize` | Apply the most recently reported path measurements to active applications. |
 | `POST` | `/api/connection` | Pause or resume SD-WAN protection. |
 | `POST` | `http://localhost:8082/v1/flows/evaluate` | Decide whether an observed hostname should use the priority overlay or normal internet. |
 
@@ -91,7 +92,8 @@ The first four endpoints are used by the local dashboard at http://localhost:808
 - `GET /api/state` returns protected applications, available routes, current connection state, and recent routing activity.
 - `POST /api/policies/{id}/toggle` enables or disables one configured application. An enabled work application is assigned `High` priority; a disabled one uses normal direct internet.
 - `POST /api/policies/enable-all` restores every configured application to enabled, `High` priority protection on the selected path. Use it to recover from individual policy changes.
-- `POST /api/optimize` re-scores the configured paths using the prototype's latency and jitter measurements, then assigns protected applications to the best path.
+- `POST /api/paths/measurements` accepts one measurement for every configured path: `name`, `latency` in milliseconds, `lossPercent`, `jitter` in milliseconds, and an RFC 3339 `measuredAt`. The control plane ranks the fresh measurements and assigns protected applications to the best path. Native device probes or the SD-WAN gateway must supply these values; a container cannot independently measure separate Fiber, LTE, and direct-network links.
+- `POST /api/optimize` reapplies the most recently reported measurements.
 - `POST /api/connection` pauses or resumes the dashboard's SD-WAN protection state.
 
 These dashboard APIs model the control-plane experience. They are not operating-system packet-routing commands.

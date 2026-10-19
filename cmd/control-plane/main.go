@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"log"
-	"math/rand/v2"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +33,15 @@ type path struct {
 	Selected bool   `json:"selected"`
 }
 
+// pathMeasurement is a real-time quality sample reported by a native probe or gateway.
+type pathMeasurement struct {
+	Name        string    `json:"name"`
+	Latency     int       `json:"latency"`
+	LossPercent float64   `json:"lossPercent"`
+	Jitter      int       `json:"jitter"`
+	MeasuredAt  time.Time `json:"measuredAt"`
+}
+
 type activity struct {
 	Time    string `json:"time"`
 	Message string `json:"message"`
@@ -37,25 +49,33 @@ type activity struct {
 }
 
 type clientState struct {
-	Connected bool          `json:"connected"`
-	Location  string        `json:"location"`
-	Apps      []application `json:"apps"`
-	Paths     []path        `json:"paths"`
-	Activity  []activity    `json:"activity"`
+	Connected       bool          `json:"connected"`
+	Location        string        `json:"location"`
+	PathsMeasuredAt string        `json:"pathsMeasuredAt"`
+	Apps            []application `json:"apps"`
+	Paths           []path        `json:"paths"`
+	Activity        []activity    `json:"activity"`
 }
 
 type server struct {
 	// Protects the shared client state while dashboard requests update policies.
-	mu    sync.RWMutex
-	state clientState
+	mu            sync.RWMutex
+	state         clientState
+	metricsURL    string
+	metricsClient *http.Client
 }
 
 // main starts the local dashboard and registers its control-plane HTTP APIs.
 func main() {
-	s := &server{state: initialState()}
+	s := &server{
+		state:         initialState(),
+		metricsURL:    os.Getenv("METRICS_URL"),
+		metricsClient: &http.Client{Timeout: 5 * time.Second},
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", health)
 	mux.HandleFunc("GET /api/state", s.getState)
+	mux.HandleFunc("POST /api/paths/measurements", s.recordPathMeasurements)
 	mux.HandleFunc("POST /api/policies/enable-all", s.enableAllPolicies)
 	mux.HandleFunc("POST /api/policies/", s.togglePolicy)
 	mux.HandleFunc("POST /api/optimize", s.optimize)
@@ -75,8 +95,9 @@ func health(w http.ResponseWriter, r *http.Request) {
 func initialState() clientState {
 	// These defaults represent the centrally distributed work-traffic policy.
 	return clientState{
-		Connected: true,
-		Location:  "Seattle, WA",
+		Connected:       true,
+		Location:        "Seattle, WA",
+		PathsMeasuredAt: "Awaiting first probe",
 		Apps: []application{
 			{ID: "zoom", Name: "Zoom", Category: "Video collaboration", Priority: "High", Route: "Fiber primary", Health: "Optimal", Active: true},
 			{ID: "salesforce", Name: "Salesforce", Category: "Customer operations", Priority: "High", Route: "Fiber primary", Health: "Optimal", Active: true},
@@ -161,32 +182,170 @@ func (s *server) enableAllPolicies(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, s.state)
 }
 
-// optimize selects the highest-scoring path and assigns protected apps to it.
+// optimize applies the most recently reported measurements to protected routes.
 func (s *server) optimize(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	bestIndex := 0
+	s.selectBestPath(true)
+	writeJSON(w, s.state)
+}
+
+// recordPathMeasurements accepts current link-quality samples and immediately updates routing.
+func (s *server) recordPathMeasurements(w http.ResponseWriter, r *http.Request) {
+	var measurements []pathMeasurement
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<10))
+	if err := decoder.Decode(&measurements); err != nil {
+		http.Error(w, "invalid measurement payload", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.Lock()
+	if err := s.applyPathMeasurements(measurements); err != nil {
+		s.mu.Unlock()
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.selectBestPath(true)
+	state := s.state
+	s.mu.Unlock()
+
+	go s.reportPathMetrics(state)
+	writeJSON(w, state)
+}
+
+// applyPathMeasurements validates a full probe cycle before replacing displayed path quality.
+func (s *server) applyPathMeasurements(measurements []pathMeasurement) error {
+	if len(measurements) != len(s.state.Paths) {
+		return fmt.Errorf("expected measurements for all %d configured paths", len(s.state.Paths))
+	}
+	pathsByName := make(map[string]*path, len(s.state.Paths))
 	for index := range s.state.Paths {
-		current := &s.state.Paths[index]
-		// The prototype perturbs synthetic probes to emulate changing home links.
-		current.Latency = max(12, current.Latency+rand.IntN(9)-4)
-		current.Jitter = max(2, current.Jitter+rand.IntN(5)-2)
-		current.Score = min(99, max(72, 100-current.Latency/2-current.Jitter))
-		if current.Score > s.state.Paths[bestIndex].Score {
-			bestIndex = index
+		pathsByName[s.state.Paths[index].Name] = &s.state.Paths[index]
+	}
+	seen := make(map[string]bool, len(measurements))
+	latestMeasurement := time.Time{}
+	for _, measurement := range measurements {
+		current, ok := pathsByName[measurement.Name]
+		if !ok || seen[measurement.Name] {
+			return fmt.Errorf("measurement name %q is not a unique configured path", measurement.Name)
+		}
+		if measurement.Latency < 0 || measurement.Jitter < 0 || measurement.LossPercent < 0 || measurement.LossPercent > 100 || measurement.MeasuredAt.IsZero() {
+			return fmt.Errorf("measurement for %q has invalid quality values", measurement.Name)
+		}
+		seen[measurement.Name] = true
+		current.Latency = measurement.Latency
+		current.Jitter = measurement.Jitter
+		current.Loss = fmt.Sprintf("%.2f%%", measurement.LossPercent)
+		current.Score = max(0, min(100, 100-measurement.Latency/2-measurement.Jitter-int(measurement.LossPercent*20)))
+		if measurement.MeasuredAt.After(latestMeasurement) {
+			latestMeasurement = measurement.MeasuredAt
 		}
 	}
+	s.state.PathsMeasuredAt = latestMeasurement.Local().Format(time.Kitchen)
+	return nil
+}
+
+// selectBestPath ranks the latest reported quality values and steers protected traffic.
+func (s *server) selectBestPath(recordActivity bool) {
+	bestIndex := selectBestPath(s.state.Paths)
 	for index := range s.state.Paths {
 		s.state.Paths[index].Selected = index == bestIndex
 	}
 	for index := range s.state.Apps {
 		if s.state.Apps[index].Active {
-			// Only protected applications follow the selected SD-WAN path.
 			s.state.Apps[index].Route = s.state.Paths[bestIndex].Name
 		}
 	}
-	s.addActivity("Route optimization completed: "+s.state.Paths[bestIndex].Name+" selected", "success")
-	writeJSON(w, s.state)
+	if recordActivity {
+		s.addActivity("Route optimization completed: "+s.state.Paths[bestIndex].Name+" selected", "success")
+	}
+}
+
+type performanceMeasurement struct {
+	Application        string  `json:"application"`
+	BaselineLatencyMS  float64 `json:"baselineLatencyMs"`
+	OptimizedLatencyMS float64 `json:"optimizedLatencyMs"`
+	BaselineLossPct    float64 `json:"baselineLossPct"`
+	OptimizedLossPct   float64 `json:"optimizedLossPct"`
+	BandwidthBytes     int64   `json:"bandwidthBytes"`
+}
+
+// reportPathMetrics sends probe-derived application metrics without blocking route selection.
+func (s *server) reportPathMetrics(state clientState) {
+	if s.metricsURL == "" || s.metricsClient == nil {
+		return
+	}
+	baseline := pathByName(state.Paths, "Direct internet")
+	optimized := selectedPath(state.Paths)
+	baselineLoss, err := lossPercent(baseline.Loss)
+	if err != nil {
+		log.Printf("parse baseline loss: %v", err)
+		return
+	}
+	optimizedLoss, err := lossPercent(optimized.Loss)
+	if err != nil {
+		log.Printf("parse optimized loss: %v", err)
+		return
+	}
+
+	for _, app := range state.Apps {
+		if !app.Active {
+			continue
+		}
+		input := performanceMeasurement{
+			Application:        app.ID,
+			BaselineLatencyMS:  float64(baseline.Latency),
+			OptimizedLatencyMS: float64(optimized.Latency),
+			BaselineLossPct:    baselineLoss,
+			OptimizedLossPct:   optimizedLoss,
+		}
+		body, err := json.Marshal(input)
+		if err != nil {
+			log.Printf("marshal metrics for %s: %v", app.ID, err)
+			continue
+		}
+		request, err := http.NewRequest(http.MethodPost, strings.TrimRight(s.metricsURL, "/")+"/v1/measurements", bytes.NewReader(body))
+		if err != nil {
+			log.Printf("create metrics request for %s: %v", app.ID, err)
+			continue
+		}
+		request.Header.Set("Content-Type", "application/json")
+		response, err := s.metricsClient.Do(request)
+		if err != nil {
+			log.Printf("report metrics for %s: %v", app.ID, err)
+			continue
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusAccepted {
+			log.Printf("report metrics for %s: metrics server returned %s", app.ID, response.Status)
+		}
+	}
+}
+
+// pathByName returns the requested configured path, or the current selection as a safe fallback.
+func pathByName(paths []path, name string) path {
+	for _, candidate := range paths {
+		if candidate.Name == name {
+			return candidate
+		}
+	}
+	return selectedPath(paths)
+}
+
+// lossPercent parses the display loss value used by the control-plane API.
+func lossPercent(value string) (float64, error) {
+	return strconv.ParseFloat(strings.TrimSuffix(value, "%"), 64)
+}
+
+// selectBestPath returns the index of the highest-scoring current measurement.
+func selectBestPath(paths []path) int {
+	bestIndex := 0
+	for index := 1; index < len(paths); index++ {
+		if paths[index].Score > paths[bestIndex].Score {
+			bestIndex = index
+		}
+	}
+	return bestIndex
 }
 
 // toggleConnection pauses or resumes the dashboard's protection state.
