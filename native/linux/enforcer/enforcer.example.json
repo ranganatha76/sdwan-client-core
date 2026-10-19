@@ -2,5 +2,9 @@
   "agentURL": "http://127.0.0.1:8082",
   "wireGuardDevice": "wg-pulseroute",
   "routeTable": 51820,
-  "firewallMark": 51820
+  "firewallMark": 51820,
+  "linkRateMbit": 100,
+  "highPriorityRateMbit": 40,
+  "highPriorityDSCP": "cs5",
+  "healthCheckIntervalSec": 10
 }
