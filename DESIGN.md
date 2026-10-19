@@ -80,7 +80,7 @@ README.md                           Setup and API reference
 
 ### Observability
 
-`metrics-server` receives per-application baseline and optimized latency/loss plus bandwidth bytes. It writes `application_performance` points to InfluxDB. The `timeseries-db` bucket retains data for `168h`, and Grafana reads that history for improvement and utilization panels. Compose deploys Grafana but dashboard/datasource provisioning is still needed before operations rollout.
+`metrics-server` receives per-application baseline and optimized latency/loss plus bandwidth bytes. It writes `application_performance` points to InfluxDB. The `timeseries-db` bucket retains data for `168h`. Compose provisions Grafana's Flux datasource and a `PulseRoute Performance` dashboard with baseline versus optimized latency/loss, bandwidth by application, and latency-improvement panels.
 
 ## API Contracts
 

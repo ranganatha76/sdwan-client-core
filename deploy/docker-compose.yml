@@ -158,6 +158,7 @@ services:
       GF_SERVER_ROOT_URL: http://localhost:3000
       GF_SECURITY_ADMIN_USER: pulseroute-admin
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      INFLUXDB_ADMIN_TOKEN: ${INFLUXDB_ADMIN_TOKEN:?set INFLUXDB_ADMIN_TOKEN in .env}
     ports:
       - "127.0.0.1:3000:3000"
     depends_on:
@@ -165,6 +166,7 @@ services:
         condition: service_healthy
     volumes:
       - grafana-data:/var/lib/grafana
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
     restart: unless-stopped
 
 volumes:

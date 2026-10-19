@@ -1,0 +1,16 @@
+apiVersion: 1
+
+datasources:
+  - name: PulseRoute Performance
+    uid: pulseroute-influxdb
+    type: influxdb
+    access: proxy
+    url: http://timeseries-db:8086
+    isDefault: true
+    jsonData:
+      version: Flux
+      organization: pulseroute
+      defaultBucket: performance
+    secureJsonData:
+      token: $INFLUXDB_ADMIN_TOKEN
+    editable: false

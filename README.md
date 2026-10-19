@@ -33,7 +33,7 @@ cp deploy/.env.example .env
 docker compose -f deploy/docker-compose.yml up --build
 ```
 
-The UI service is available at http://localhost:8080, Grafana at http://localhost:3000, the data-plane decision API on loopback at http://localhost:8082, and metrics ingestion on loopback at http://localhost:8083. InfluxDB retains performance data for seven days. The Compose stack runs every custom Go service as non-root with a read-only filesystem and no Linux capabilities. Compose health checks require the control plane, policy snapshot, and InfluxDB before dependent services are treated as ready.
+The UI service is available at http://localhost:8080, Grafana at http://localhost:3000, the data-plane decision API on loopback at http://localhost:8082, and metrics ingestion on loopback at http://localhost:8083. InfluxDB retains performance data for seven days. Grafana automatically provisions the `PulseRoute Performance` dashboard and its InfluxDB data source. The Compose stack runs every custom Go service as non-root with a read-only filesystem and no Linux capabilities. Compose health checks require the control plane, policy snapshot, and InfluxDB before dependent services are treated as ready.
 
 ## UI Service
 
