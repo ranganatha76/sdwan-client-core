@@ -2,6 +2,14 @@
 
 PulseRoute is a lightweight Go prototype for a laptop SD-WAN client control plane. It presents routing health, prioritizes business and productivity applications, and lets a user simulate route optimization from a local web dashboard.
 
+## What This App Is For
+
+PulseRoute is an application-aware routing and observability layer for remote work. It is designed to complement, not replace, an organization-approved Cisco AnyConnect, Zscaler, or other corporate VPN/SSE client.
+
+An enterprise VPN provides identity, secure access, inspection, and corporate routing. PulseRoute adds a decision layer that can identify approved work applications, compare approved network paths, and choose a preferred path for latency-sensitive traffic such as Zoom, Teams, Slack, GitHub, Bitbucket, and productivity SaaS applications. Unmatched personal traffic remains on its ordinary internet route.
+
+This is useful only where corporate network policy permits the required split-routing or approved overlay integration. It must never bypass a full-tunnel, inspection, or security policy imposed by the corporate VPN. In a production deployment, an authorized native adapter and gateway enforce the selected path; the local Go services alone do not alter host traffic.
+
 ## Prerequisites
 
 - Go 1.26 or newer

@@ -6,6 +6,14 @@ PulseRoute is a software-defined WAN control and decision prototype for remote d
 
 The Go service layer is safe to run locally: it makes and records routing decisions without intercepting host traffic. On Linux, a separately installed, root-owned native enforcer can consume the same data-plane API to apply policy routing and QoS to WireGuard overlay traffic. macOS and Windows enforcement remain platform-specific delivery work.
 
+## Problem It Solves
+
+Remote users often reach work applications through changing home, mobile, and public networks. A corporate VPN or security service such as Cisco AnyConnect or Zscaler remains responsible for identity, secure access, inspection, and corporate routing, but it does not necessarily make per-application decisions based on current path quality. A collaboration call, source-control operation, and personal streaming session can otherwise compete for the same constrained link or follow a path with excessive latency, jitter, or loss.
+
+PulseRoute is an optional, policy-controlled decision layer alongside that approved security client. It maps recognized work destinations to a priority policy, consumes measurements from an authorized device probe or gateway, selects the highest-quality permitted path, and records the resulting baseline versus optimized performance. Personal and unmatched traffic stays on its ordinary internet route. If policy, telemetry, the agent, or the overlay is unavailable, the system fails open to normal routing rather than blocking access.
+
+PulseRoute is not a VPN replacement or a mechanism to bypass corporate controls. It is only deployable where the organization permits split routing or an approved SD-WAN overlay integrated with its existing VPN/SSE policy.
+
 ## Goals
 
 - Prioritize recognized work traffic such as Zoom, Slack, Teams, GitHub, Bitbucket, and productivity applications.
@@ -68,7 +76,7 @@ README.md                           Setup and API reference
 
 ### Control Plane
 
-`control-plane` owns application enablement, selected path, simulated path health, and activity history. Its APIs query state, toggle one application, enable all applications, optimize paths, and pause/resume protection. Optimization currently changes synthetic latency and jitter values, selects the highest score, and moves enabled applications to that path.
+`control-plane` owns application enablement, selected path, reported path health, and activity history. Its APIs query state, toggle one application, enable all applications, accept a complete timestamped path-measurement cycle, apply the current selection, and pause/resume protection. A device probe or SD-WAN gateway supplies latency, loss, and jitter for every configured path; the control plane scores those values and moves enabled applications to the best path.
 
 ### Policy Service
 
@@ -91,7 +99,8 @@ README.md                           Setup and API reference
 | `GET` | `/api/state` | Connection, applications, paths, and activity. |
 | `POST` | `/api/policies/{id}/toggle` | Switches one application policy. |
 | `POST` | `/api/policies/enable-all` | Enables all applications at high priority. |
-| `POST` | `/api/optimize` | Selects the best simulated path. |
+| `POST` | `/api/paths/measurements` | Accepts a complete timestamped path-measurement cycle and selects the best path. |
+| `POST` | `/api/optimize` | Reapplies the most recently reported path measurements. |
 | `POST` | `/api/connection` | Pauses or resumes protection. |
 
 ### Data Plane
