@@ -33,7 +33,7 @@ cp .env.example .env
 docker compose up --build
 ```
 
-The control plane is available at http://localhost:8080. The data-plane decision API is available only on loopback at http://localhost:8082. The Compose stack runs every service as non-root with a read-only filesystem and no Linux capabilities.
+The control plane is available at http://localhost:8080, Grafana at http://localhost:3000, the data-plane decision API on loopback at http://localhost:8082, and metrics ingestion on loopback at http://localhost:8083. InfluxDB retains performance data for seven days. The Compose stack runs every custom Go service as non-root with a read-only filesystem and no Linux capabilities.
 
 For Colima:
 
@@ -80,3 +80,7 @@ Actual traffic interception is platform-specific and must not be enabled solely 
 - **macOS**: requires a signed application bundle, an Apple Developer Team with the Network Extension entitlement, and a Packet Tunnel provider. Docker and Colima cannot intercept macOS host traffic.
 
 Do not store WireGuard private keys, gateway credentials, or Apple signing credentials in `.env`, source control, or this repository.
+
+## Platform Support
+
+The Go control plane, policy service, data-plane decision agent, metrics service, InfluxDB, and Grafana run unchanged on macOS, Linux (including Ubuntu), and Windows through Docker Desktop or Colima where available. Actual packet interception is implemented as a small native adapter that calls the same local agent API: Network Extension on macOS, eBPF or nftables with WireGuard on Linux/Ubuntu, and Windows Filtering Platform on Windows.

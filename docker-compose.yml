@@ -65,3 +65,59 @@ services:
       timeout: 3s
       retries: 3
     restart: unless-stopped
+
+  timeseries-db:
+    image: influxdb:2.7-alpine
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: pulseroute
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUXDB_ADMIN_TOKEN:?set INFLUXDB_ADMIN_TOKEN in .env}
+      DOCKER_INFLUXDB_INIT_ORG: pulseroute
+      DOCKER_INFLUXDB_INIT_BUCKET: performance
+      DOCKER_INFLUXDB_INIT_RETENTION: 168h
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUXDB_ADMIN_TOKEN:?set INFLUXDB_ADMIN_TOKEN in .env}
+    volumes:
+      - influx-data:/var/lib/influxdb2
+    expose:
+      - "8086"
+    restart: unless-stopped
+
+  metrics-server:
+    build:
+      context: .
+      args:
+        TARGET: ./cmd/metrics-server
+    environment:
+      INFLUX_URL: http://timeseries-db:8086
+      INFLUX_TOKEN: ${INFLUXDB_ADMIN_TOKEN:?set INFLUXDB_ADMIN_TOKEN in .env}
+      INFLUX_ORG: pulseroute
+      INFLUX_BUCKET: performance
+    depends_on:
+      - timeseries-db
+    ports:
+      - "127.0.0.1:8083:8083"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    environment:
+      GF_SERVER_ROOT_URL: http://localhost:3000
+      GF_SECURITY_ADMIN_PASSWORD: ${INFLUXDB_ADMIN_TOKEN:?set INFLUXDB_ADMIN_TOKEN in .env}
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - timeseries-db
+    volumes:
+      - grafana-data:/var/lib/grafana
+    restart: unless-stopped
+
+volumes:
+  influx-data:
+  grafana-data:

@@ -56,6 +56,14 @@ The Compose deployment separates three processes:
 
 All containers run as non-root, have a read-only filesystem, drop Linux capabilities, and use bounded HTTP timeouts. The shared policy token is supplied at runtime through `.env`, never baked into an image.
 
+## Observability
+
+`metrics-server` receives per-application measurements containing baseline and optimized latency and loss, plus bandwidth bytes. It writes them to the separate `timeseries-db` InfluxDB service, which has a fixed 168-hour retention policy. Grafana is a separate service that reads the retained series to show product improvement over the baseline and bandwidth utilization by application such as Zoom, Slack, and Teams.
+
+## Platform Independence
+
+The control, policy, decision, metrics, storage, and visualization services are ordinary Go or containerized services and run unchanged on macOS, Linux/Ubuntu, and Windows. Platform-specific code is limited to the privileged flow collector and route enforcer, which submits normalized hostname or SNI metadata to the common decision API and applies its returned action.
+
 ## Production Data Plane
 
 The agent is deliberately a decision service, not a privileged packet interceptor. A real endpoint data plane must be installed as a signed, OS-specific component with narrowly scoped permissions. On Linux it can connect an eBPF or nftables flow collector to the agent; on macOS it should use Network Extension APIs; and on Windows it should use Windows Filtering Platform. That privileged component should enforce the returned action through a managed overlay tunnel, retain a direct-route fail-open policy, and emit audited decisions.
@@ -67,3 +75,7 @@ The enforcement component should classify flows at the socket or traffic-control
 ### macOS
 
 The enforcement component must be a signed Packet Tunnel Network Extension. It receives packets through `NEPacketTunnelFlow`, sends flow metadata to the local agent, and forwards only approved priority traffic through an authenticated gateway. Enabling this requires an Apple Developer Team, the Network Extension entitlement, user approval, and a packaged app; containers cannot grant these capabilities.
+
+### Windows
+
+The enforcement component should use Windows Filtering Platform to associate flows with hostname metadata and apply the decision agent's selected tunnel or direct route. It must be signed, installed with the minimum required service privileges, and preserve a direct-route fail-open path when the local agent or overlay is unavailable.
