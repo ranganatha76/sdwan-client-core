@@ -382,6 +382,9 @@ func postJSON(ctx context.Context, client *http.Client, endpoint string, value a
 		return err
 	}
 	request.Header.Set("Content-Type", "application/json")
+	if token := os.Getenv("METRICS_AUTH_TOKEN"); token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
 	response, err := client.Do(request)
 	if err != nil {
 		return err

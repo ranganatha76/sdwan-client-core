@@ -7,6 +7,7 @@ services:
         TARGET: ./cmd/control-plane
     environment:
       METRICS_URL: http://metrics-server:8083
+      METRICS_AUTH_TOKEN: ${METRICS_AUTH_TOKEN:-}
     depends_on:
       metrics-server:
         condition: service_healthy
@@ -138,6 +139,7 @@ services:
       INFLUX_TOKEN: ${INFLUXDB_ADMIN_TOKEN:?set INFLUXDB_ADMIN_TOKEN in .env}
       INFLUX_ORG: pulseroute
       INFLUX_BUCKET: performance
+      METRICS_AUTH_TOKEN: ${METRICS_AUTH_TOKEN:-}
     depends_on:
       timeseries-db:
         condition: service_healthy

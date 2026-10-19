@@ -6,11 +6,39 @@ PulseRoute is a software-defined WAN control and decision prototype for remote d
 
 The Go service layer is safe to run locally: it makes and records routing decisions without intercepting host traffic. On Linux, a separately installed, root-owned native enforcer can consume the same data-plane API to apply policy routing and QoS to WireGuard overlay traffic. macOS and Windows enforcement remain platform-specific delivery work.
 
+## Document Status and Reading Guide
+
+This design records the implementation and verification baseline as of 2026-10-19. Sections explicitly marked as target or production requirements are not shipped capabilities. The initial delivery focus is an operator-managed Linux WireGuard evaluation on customer-authorized infrastructure, not a production multi-tenant service.
+
+Read the capability matrix first, the service and packet-flow sections for current behavior, the provisioning and verification sections for the tested Linux workflow, and the production architecture and commercial gates for remaining work. Operational commands and public peer examples live in the [Linux WireGuard runbook](deploy/wireguard/README.md); this document defines their design and limitations.
+
+### Capability and Evidence Matrix
+
+| Capability | Implementation status | Evidence and boundary |
+| --- | --- | --- |
+| Dashboard, policy matching, and path scoring | Implemented prototype | In-memory state; scoring changes dashboard selections, not a privileged host route. |
+| Live Linux path measurements | Implemented | Interface-bound ICMP probe submits a complete cycle; not application-level quality or gateway selection. |
+| Telemetry ingestion authentication | Implemented, opt-in | All five ingestion POST routes require the configured shared bearer credential; no device identity or tenant boundary. |
+| Linux destination routing and QoS | Implemented, explicit IPv4 destinations | Requires an existing tunnel and an operator or external collector; fail-open watchdog checks agent readiness and device existence. |
+| WireGuard local identity/configuration | Implemented, operator-managed | Local persistent keys, private files, strict public plan validation, and no-overwrite publication. Does not activate interfaces or enroll devices remotely. |
+| WireGuard encrypted packet exchange | Verified in an isolated Linux ARM64 test | Real handshake, bidirectional ICMP, overwrite rejection, and runtime peer removal. Not internet egress, resilience, or application improvement. |
+| AnyConnect/GlobalProtect-compatible lifecycle | Partial, Linux OpenConnect adapter | One approved configured gateway; connect/status/disconnect. No proprietary-client control or automatic gateway failover. |
+| Zscaler management | Not implemented | Requires an authorized, vendor-supported integration; not provided by OpenConnect. |
+| WireGuard enrollment/rotation and gateway service | Not implemented | Configuration generation is not an enrollment authority, reconciler, or forwarding service. |
+| IPsec provisioning | Not implemented | Separate protocol lifecycle, identity, configuration, and integration tests are required. |
+| Tunnel-only/fail-closed policy | Not implemented | Existing enforcer removes owned rules on failure; no IPv6 leak-prevention claim. |
+| Automatic DNS/SNI/application discovery | Not implemented | Hostname decision API exists, but no authoritative observation-to-enforcement pipeline. |
+| macOS enforcement | Incomplete integration source | Entitlement, signing, classification, and forwarding work remain. |
+| Windows enforcement | Planned only | No shipped WFP enforcement service or driver. |
+| Multi-tenant managed service and recurring billing | Not implemented | Requires durable identity/authorization, service operation, billing, and customer acceptance. |
+
+No row in this table constitutes a production certification. A passing namespace test demonstrates the named technical behavior only.
+
 ## Problem It Solves
 
 Remote users often reach work applications through changing home, mobile, and public networks. A corporate VPN or security service such as Cisco AnyConnect or Zscaler remains responsible for identity, secure access, inspection, and corporate routing, but it does not necessarily make per-application decisions based on current path quality. A collaboration call, source-control operation, and personal streaming session can otherwise compete for the same constrained link or follow a path with excessive latency, jitter, or loss.
 
-PulseRoute is an optional, policy-controlled decision layer alongside that approved security client. It maps recognized work destinations to a priority policy, consumes measurements from an authorized device probe or gateway, selects the highest-quality permitted path, and records the resulting baseline versus optimized performance. Personal and unmatched traffic stays on its ordinary internet route only where the organization's VPN/SSE policy permits local breakout. If policy, telemetry, the agent, or the overlay is unavailable, the current native implementation fails open to normal routing rather than blocking access.
+PulseRoute is an optional, policy-controlled decision layer alongside that approved security client. It maps recognized work destinations to a priority policy, consumes submitted path measurements, selects a preferred dashboard path, and records probe-derived comparisons. Native packet steering is a separate operation and is not automatically driven by the dashboard selection. Personal and unmatched traffic stays on its ordinary route only where the organization's VPN/SSE policy permits local breakout. The current watchdog removes PulseRoute-owned rules when the local agent is not ready or the WireGuard device is absent. Telemetry-storage failure alone does not trigger that rollback.
 
 PulseRoute is not a VPN replacement or a mechanism to bypass corporate controls. It is only deployable where the organization permits split routing or an approved SD-WAN overlay integrated with its existing VPN/SSE policy.
 
@@ -23,10 +51,16 @@ PulseRoute has two mutually exclusive organization-selected deployment models:
 
 `direct-internet` is a policy result only for traffic that the organization has explicitly approved for local breakout. In a full-tunnel deployment, the native adapter must retain the corporate VPN path for protected work traffic. The current Linux adapter is intentionally fail-open and therefore cannot enforce a tunnel-only, fail-closed policy.
 
+### OpenConnect Compatibility Boundary
+
+The optional `native/linux/openconnect` command launches the system OpenConnect binary using either `anyconnect` or `gp` against one approved HTTPS gateway from a root-owned private configuration. Its lifecycle operations are connect, process/interface status, and clean disconnect. Authentication remains interactive or organization-managed; PulseRoute does not store passwords, session cookies, MFA responses, or private authentication keys.
+
+Protocol compatibility does not establish compatibility with every gateway authentication, posture, SSO, or licensing configuration. Each customer must authorize the client and validate its actual gateway. The adapter neither drives a vendor-installed AnyConnect/GlobalProtect client nor implements Zscaler management, gateway discovery, vendor policy administration, or multi-gateway failover. Process and interface status are not proof that protected application traffic is healthy.
+
 ## Goals
 
 - Prioritize recognized work traffic such as Zoom, Slack, Teams, GitHub, Bitbucket, and productivity applications.
-- Keep unrelated household traffic on its ordinary internet route.
+- Leave unmatched device traffic on its ordinary organization-approved route; PulseRoute on a laptop does not control other household devices.
 - Make routing decisions inspectable through the local UI and APIs.
 - Run the service layer unchanged on macOS, Linux/Ubuntu, and Windows.
 - Retain performance and bandwidth measurements for seven days.
@@ -34,7 +68,7 @@ PulseRoute has two mutually exclusive organization-selected deployment models:
 
 ## Non-Goals
 
-- Go services do not configure OS routes, WireGuard peers, VPN tunnels, eBPF, or Windows Filtering Platform rules.
+- Network-facing Go services do not configure OS routes, WireGuard peers, VPN tunnels, eBPF, or Windows Filtering Platform rules. The separate offline provisioner writes local configuration files only.
 - The Linux enforcer does not create a WireGuard peer, discover application hostnames, or guarantee upstream DSCP treatment. A deployment-managed WireGuard configuration and an authoritative DNS/SNI flow collector remain required.
 - Docker containers do not intercept macOS, Windows, or host Linux traffic.
 - Control-plane state is in memory and resets on restart.
@@ -67,16 +101,23 @@ cmd/
     policy-service/                 Authenticated policy snapshot provider
   data-plane/agent/                 Flow-decision API for native adapters
   observability/metrics-server/     Metrics composition root and server lifecycle
+  wireguard-provision/              Offline identity and WireGuard config generation
 internal/policy/                    Shared policy snapshot and hostname matching
 internal/telemetry/                 Typed models, validation, HTTP API, and InfluxDB writer
+internal/wireguard/                 Peer-plan validation, key generation, private publication
 deploy/                             Docker image, Compose stack, environment template
+  lab/                              Ephemeral WireGuard impairment/recovery lab
+  wireguard/                        Provisioning runbook and isolated Linux kernel test
 native/
   linux/enforcer/                   Root-owned WireGuard route and QoS enforcer
+  linux/path-probe/                 Interface-bound live quality probe, no routing changes
+  linux/openconnect/                Optional approved OpenConnect lifecycle wrapper
   linux/telemetry/                  Observe-only endpoint health collector
   linux/systemd/                    Fail-open enforcement watchdog unit
   macos/                            Host app and Packet Tunnel Xcode project
 CodeWalkThrough.md                  Service and request-flow guide
 README.md                           Setup and API reference
+.github/workflows/wireguard.yml      Linux provisioning and packet-exchange CI proof
 ```
 
 ## Service Responsibilities
@@ -88,6 +129,16 @@ README.md                           Setup and API reference
 ### Control Plane
 
 `control-plane` owns application enablement, selected path, reported path health, and activity history. Its APIs query state, toggle one application, enable all applications, accept a complete timestamped path-measurement cycle, apply the current selection, and pause/resume protection. A device probe or SD-WAN gateway supplies latency, loss, and jitter for every configured path; the control plane scores those values and moves enabled applications to the best path.
+
+These assignments update control-plane state only. No current command delivers the selected dashboard path to a gateway reconciler or switches an existing application connection between tunnels. A native route change must be independently applied and observed before the UI may describe that route as enforced.
+
+The initial state has `MeasurementsReady=false`, with unavailable rather than fabricated quality values. `POST /api/optimize` returns `409 Conflict` until a complete measurement cycle has been accepted. Control-plane restart discards the measurement and selection state. A previously accepted cycle is not continuous proof of health; expiry, hysteresis, and reconciled enforcement are production follow-up work.
+
+### Live Path Probe
+
+`native/linux/path-probe` accepts repeated `name,interface,target` path definitions and uses Linux `ping -I` to collect latency, jitter, and loss. It submits a full cycle to `/api/paths/measurements`; the configured path names must match the control plane. Target hostnames/IPs stay in local probe configuration and are not part of the measurement payload.
+
+Interface-bound ICMP measures that probe path, not a Zoom call, TCP transfer, or mandatory encrypted gateway path. A deployment must demonstrate where its probe packets actually travel. Probe success does not establish peer authorization, gateway capacity, allowed egress, or a better application experience. The probe never modifies routes, creates a tunnel, or discovers live application flows.
 
 ### Policy Service
 
@@ -136,11 +187,23 @@ A decision includes `action`, `priority`, optional `matchedRule`, `policyVersion
 
 All telemetry writes return `202 Accepted` only after InfluxDB returns `204 No Content`. Invalid JSON, invalid tags, invalid quality ranges, unsupported SLO names, or ambiguous route decisions return `400 Bad Request`. Storage or readiness failures return `503 Service Unavailable`; callers own retry behavior. Request bodies are bounded to 16 KiB except route decisions, which allow 64 KiB for up to eight candidate paths.
 
+### Ingestion Authentication Contract
+
+`NewHandler` retains the legacy local-development contract. The metrics process uses `NewAuthenticatedHandler` with `METRICS_AUTH_TOKEN`. A non-empty setting enables authentication without changing request/response schemas or endpoint versions. Every POST request is checked before dispatch, decoding, or storage access. Missing, malformed, or incorrect bearer credentials return `401 Unauthorized` and `WWW-Authenticate: Bearer`.
+
+The handler hashes the expected and supplied authorization values to fixed-size SHA-256 digests and compares them using constant-time equality. This limits comparison leakage; it does not encrypt HTTP, establish who owns a credential, or prevent replay after credential theft. All producers with that shared credential have the same ingestion authority.
+
+Compose supplies the same optional setting to metrics-server and control-plane. Both control-plane measurement types and the Linux telemetry collector send the authorization header when configured. External SLO integrations must be updated separately. Health/readiness checks stay accessible without credentials; expose them only inside an approved local or management boundary.
+
+Activation requires a distinct secret, at least 32 random characters as an operator requirement, applied to the server and all producers. The current handler does not enforce that minimum or reject an empty setting. Empty means legacy unauthenticated mode, not automatic secure operation. Local environment files are a development mechanism; a managed deployment needs controlled secret injection and TLS for remote transport.
+
+Only one credential is accepted at a time. Coordinate rotation in a maintenance window and expect temporary `401` responses if deployment order differs. No dual-key rotation, per-device revocation, tenant scope, replay protection, rate limiting, or durable retry queue is implemented. Rollback may clear the opt-in setting only inside a controlled local environment; never restore unauthenticated ingestion on an exposed service.
+
 ## Endpoint Experience Telemetry
 
 ### Design Intent
 
-Endpoint experience telemetry is an **observe-only** diagnostic plane. It answers: “Was a supported work application measurably better after the control plane chose a path, and what local endpoint condition or candidate comparison explains that result?” It does not inspect application payloads, capture browsing history, or make enforcement decisions. The existing Linux enforcer remains the only native component capable of changing Linux packet state, and it remains separately installed, root-owned, and gated by `DATAPLANE_MODE=enforce`.
+Endpoint experience telemetry is an **observe-only** diagnostic plane. It answers: “Was a supported work application measurably better after the control plane chose a path, and what local endpoint condition or candidate comparison explains that result?” It does not inspect application payloads, capture browsing history, or make enforcement decisions. The Linux enforcer is the component that applies PulseRoute destination routing and QoS after an enforce-mode decision. The optional OpenConnect adapter separately manages its approved VPN lifecycle; it is not called by telemetry or the enforcer.
 
 The feature is intentionally staged:
 
@@ -194,7 +257,7 @@ DNS, TLS, and ICMP probes are disabled unless the operator supplies `--dns-host`
 
 ### Privacy and Security Boundary
 
-Collected and persisted metadata is intentionally limited to opaque device ID, coarse network type, interface name, VPN provider and availability, aggregate resource state, optional Wi-Fi signal strength, approved-probe booleans and aggregates, route-decision metadata, and approved application/SLO identifiers. The system does **not** collect or persist packet payloads, URLs, hostnames, DNS query history, destination history, SSIDs, BSSIDs, Wi-Fi channels, MAC addresses, gateway addresses, IP route entries, application content, process names, commands, keystrokes, or user activity.
+Collected and persisted telemetry metadata is intentionally limited to opaque device ID, coarse network type, interface name, VPN provider and availability, aggregate resource state, optional Wi-Fi signal strength, approved-probe booleans and aggregates, route-decision metadata, and approved application/SLO identifiers. The telemetry schema does **not** collect or persist packet payloads, URLs, hostnames, DNS query history, destination history, SSIDs, BSSIDs, Wi-Fi channels, MAC addresses, gateway addresses, IP route entries, application content, process names, commands, keystrokes, or user activity. This restriction applies to telemetry, not operator configuration: peer plans and native configurations necessarily contain approved gateway/destination addresses, and WireGuard identity/configuration files contain local cryptographic keys.
 
 The metrics API validates all tag values against InfluxDB line-protocol separators, bounds string field values, bounds loss to 0 through 100, bounds Wi-Fi signal to plausible negative dBm values, and rejects negative counters or quality values. Native collector subprocesses use explicit arguments without a shell. Metrics endpoint health returns generic failures and never exposes backend credentials. In production, the loopback API must be protected by endpoint identity or mutually authenticated local IPC, and InfluxDB must use a scoped write token rather than the bootstrap administrator token.
 
@@ -206,6 +269,7 @@ Deployment should begin with a small managed cohort in `DATAPLANE_MODE=observe`,
 
 ## Security Boundaries
 
+- Metrics ingestion supports opt-in bearer authentication through `METRICS_AUTH_TOKEN`. When configured, all five telemetry POST routes require the credential before payload decoding or storage access. The control-plane publishers and Linux telemetry collector send this credential; `/healthz` and `/readyz` remain unauthenticated for local service checks. Empty configuration preserves legacy behavior and is not suitable for a managed production deployment. This shared ingestion credential does not provide per-device identity or tenant isolation.
 - `POLICY_SERVICE_TOKEN` protects policy snapshot access. It must be a unique runtime secret of at least 32 characters.
 - `INFLUXDB_ADMIN_TOKEN` initializes the local database. `GRAFANA_ADMIN_PASSWORD` is a distinct Grafana login secret. Production must use separate, scoped service credentials from a secret manager; neither administrator credential should be used by an application workload.
 - Custom Go containers run non-root with a read-only filesystem, `/tmp` tmpfs, dropped Linux capabilities, and `no-new-privileges`.
@@ -230,7 +294,7 @@ The Go service layer is portable. Only interception and enforcement differ by OS
 
 - **Linux/Ubuntu**: the implemented `pulseroute-enforcer` uses nftables destination sets, an output-chain firewall mark, and an `ip rule` plus dedicated route table to steer approved IPv4 destinations through a pre-existing WireGuard device. It configures HTB classes on that device. High-priority overlay decisions are entered in a separate set, receive configured DSCP (`cs5` by default), and select HTB class `1:10`; standard overlay traffic uses the default class. `uninstall` deletes only PulseRoute's nftables table, route rule/table, and root qdisc. The `pulseroute-enforcer.service` watchdog checks local agent readiness and WireGuard device existence; on failure it removes those rules so traffic returns to the normal direct route. The root-owned JSON configuration includes the WireGuard device, route table, firewall mark, link rate, high-priority allocation, DSCP, and watchdog interval. It must not contain WireGuard private keys.
 - **macOS**: `PulseRoute.xcodeproj` builds an unsigned host app and embedded Packet Tunnel target. The provider reads `remoteAddress`, `ipv4Address`, `ipv4SubnetMask`, and `agentURL` from managed `providerConfiguration`, refuses incomplete values, and consults the local agent for hostname decisions. It requires an Apple Developer Team, Network Extension entitlement, provisioning, user approval, signing, and notarized packaging before installation. Packet-flow classification and gateway forwarding are not yet implemented.
-- **Windows**: a signed least-privileged service uses Windows Filtering Platform to associate flows with hostname metadata, calls the agent, and selects overlay or direct routing.
+- **Windows, planned**: a future signed least-privileged service would use Windows Filtering Platform to associate flows with hostname metadata, call the agent, and select approved routing. No Windows enforcer or driver is currently supplied.
 
 Linux operators must set WireGuard `PersistentKeepalive` and add gateway-path monitoring: interface existence alone does not prove the overlay peer is reachable. The enforcer accepts IPv4 destinations only; IPv6 policy enforcement is not implemented. Every adapter should begin in observe mode, emit measurements, be canaried to managed devices, and preserve direct internet as the failure path.
 
@@ -275,7 +339,7 @@ This scheduling decision is local to the laptop's egress queue. The gateway and 
 
 #### Gateway and Return-Path Requirements
 
-The SD-WAN gateway is outside this repository and must be provisioned separately. It needs a WireGuard peer for the laptop, a tunnel address plan, forwarding enabled, firewall policy, and either source NAT or explicit return routes so replies to selected SaaS flows return through the same tunnel. It must have a managed egress path that is measurably better than the laptop's direct ISP path for the selected services; otherwise the extra tunnel hop can increase latency.
+The operational SD-WAN gateway must be provisioned separately. The offline provisioner can generate its local WireGuard key and peer configuration, but does not install peers in the kernel, configure forwarding, deploy a VM, or reconcile a gateway service. The gateway needs a tunnel address plan, forwarding, restrictive firewall policy, and either source NAT or explicit return routes so replies to selected SaaS flows return through the same tunnel. Its managed egress path must demonstrate a benefit for the selected workload before claiming optimization; otherwise the extra tunnel hop can increase latency.
 
 The WireGuard configuration owns endpoint address and port, gateway public key, laptop private key, tunnel address, `AllowedIPs`, and `PersistentKeepalive`. Private keys and gateway credentials stay in root-owned deployment configuration or a secrets system and are never written to the PulseRoute repository or Docker environment.
 
@@ -287,7 +351,7 @@ The watchdog checks local data-plane-agent readiness and WireGuard device existe
 
 #### Current Enforcement Boundary
 
-The repository implements explicit Linux destination evaluation and application of nftables, policy-routing, DSCP, and HTB state. It does not yet implement the authoritative DNS/SNI collector, WireGuard peer provisioning, gateway forwarding/NAT, IPv6 split tunneling, or active gateway-path measurement. Those components are required before claiming autonomous per-application production steering.
+The repository implements explicit Linux destination evaluation and application of nftables, policy-routing, DSCP, and HTB state, plus offline WireGuard configuration generation. It does not implement authoritative flow discovery, automatic peer installation/enrollment, gateway forwarding/NAT automation, IPv6 split tunneling, or handshake-aware gateway-health reconciliation. Interface-bound ICMP probing exists but is not integrated into that watchdog. These gaps must be closed before claiming autonomous per-application production steering.
 
 ### Scenario Sequences
 
@@ -458,7 +522,90 @@ sequenceDiagram
 
 The dashboard does not prove an overlay benefit by itself. Measurements must compare equivalent workloads and time windows, and the adapter must record both direct-path baseline and overlay-path values before any performance claim is made.
 
+## Implemented WireGuard Provisioning Design
+
+### Scope and Trust Model
+
+`cmd/wireguard-provision` is an offline operator tool with `init` and `configure` operations. `internal/wireguard` owns the validation, key generation, rendering, and file publication logic. Neither operation runs privileged network commands, calls a remote enrollment service, creates a tunnel, changes a firewall, or starts a service. Administration of the endpoint and gateway remains with the organization.
+
+Run the tool locally on each machine against an administrator-controlled directory outside the source checkout. Root-owned deployment locations are an installation procedure, not an ownership check implemented by the portable library. The caller must ensure that the directory and all its parents cannot be replaced by an untrusted user while a privileged invocation runs. Mode checks alone do not establish that ownership or prevent every filesystem race.
+
+### Identity Initialization
+
+1. `init` generates a WireGuard private key using `wgctrl/wgtypes`, rather than a custom key algorithm.
+2. The tool requires a new identity directory with an existing parent. Directory creation requests mode `0700`.
+3. It publishes `private.key` and `public.key` with private file permissions. The public key can be shared through an authenticated administrative channel; the private key stays local.
+4. Repeating `init` against an existing directory returns an error rather than rotating or overwriting identity.
+5. The caller gets a completion message, not the private key or generated configuration on stdout.
+
+Initialization is not a multi-file transaction. If execution stops after creating one file, the directory can remain incomplete. Recovery must inspect and quarantine that identity, determine whether its public peer was already authorized elsewhere, and create a replacement in a new approved directory if necessary. Blind deletion and retry could orphan an authorized peer.
+
+### Peer Plan Contract
+
+The input is one JSON document with no unknown fields. Decoding uses a bounded reader of approximately 64 KiB and rejects a second JSON document. The plan deliberately has no private-key, shell-hook, DNS-override, or executable field.
+
+| Field | Meaning | Current validation |
+| --- | --- | --- |
+| `interface` | Output interface/configuration name | One to fifteen safe alphanumeric, underscore, or hyphen characters; starts alphanumeric. |
+| `address` | Local tunnel IPv4 address and prefix | Parseable global-unicast IPv4 address, including private unicast; no `/0`. |
+| `listenPort` | Local WireGuard UDP port | Integer 1 through 65535. |
+| `peers` | Authorized public peer descriptions | At most 256 entries; zero entries can stage an unpeered interface. |
+| `publicKey` | Remote WireGuard public key | Parseable, nonzero, unique across the plan; self-peering rejected when rendering against the local key. |
+| `allowedIPs` | Peer cryptokey routing/source ranges | One to 64 entries per peer; canonical IPv4 prefixes, non-default, unicast starting address, excluding the local interface address; no overlaps within or between peers. |
+| `endpoint` | Optional remote transport endpoint | Hostname or IPv4-form host plus port 1 through 65535; no IPv6 endpoint syntax or configuration-line injection. |
+| `keepalive` | Optional persistent keepalive seconds | Integer 0 through 65535; zero omits the directive. |
+
+These checks are syntactic and local, not a policy authority. They do not prove domain ownership, UDP reachability, globally unique tunnel address allocation, correct gateway selection, or that every address in a broad prefix is an approved destination. Require administrator review and narrow prefixes for the pilot. `AllowedIPs` is not a substitute for tenant isolation or a forwarding firewall.
+
+### Configuration Publication
+
+`configure` checks that the identity directory is a real private directory, and that `private.key` is a bounded private regular file rather than a symlink. It reads and parses the local key, validates the plan, rejects self-peering, and constructs only supported WireGuard/`wg-quick` directives.
+
+The resulting `<interface>.conf` includes the private key, local address, listen port, `Table = off`, and approved peer settings. `Table = off` is a deliberate boundary: bringing up the interface does not automatically replace a default route or install routes for every peer prefix. A separately reviewed route/enforcement action is required. There are no generated `PostUp` or `PostDown` shell hooks.
+
+For each file, publication uses a private temporary file in the destination directory, writes and syncs its contents, closes it, and hard-links it to the final path without replacement. The temporary name is removed afterward. An existing destination, including a symlink, causes failure. Filesystems must support same-directory hard links. This is atomic publication of an individual file, not a transactional installation, and directory entries are not explicitly synced for a power-loss durability guarantee.
+
+The generated configuration is a secret even though the peer plan is public metadata. Do not upload it as a CI artifact, log it, commit it, or send it to support. The tool does not implement a hardware keystore, encrypted local key storage, automatic expiry, or backup management.
+
+### Installation, Change, Revocation, and Rollback
+
+Installation is a reviewed administrator workflow: exchange public keys, review both plans, generate locally, install configuration as root with mode `0600`, verify management access and the required gateway firewall, then activate WireGuard and explicit test routes. Only after handshake and approved-path verification should the existing enforcer be considered. Interface startup alone is not application optimization.
+
+Configuration changes must not be performed by weakening overwrite protection. Stage a new reviewed configuration and schedule an explicit switch, retaining the prior approved state under encrypted access control. Key rotation creates a new identity and updates peer authorization on both sides; automatic overlap, expiry, and rollback orchestration are future work.
+
+Revocation must remove the public peer from both the running gateway and its persisted configuration. Removing only the kernel peer is temporary: a later configuration reload can restore it. Offboarding also removes startup/assignment authorization and handles encrypted backups according to policy.
+
+For enforcement rollback, stop the watchdog and run the enforcer's `uninstall` operation before taking down the tunnel. Verify that only PulseRoute-owned state was removed and that organization-required corporate routing remains intact. Do not delete identity files during routine connectivity recovery. Gateway firewall, forwarding, and NAT changes need their own reviewed rollback because this tool does not own them.
+
+## Verification Evidence and Limits
+
+### Checks Completed for This Baseline
+
+| Check | Observed result | What it does not establish |
+| --- | --- | --- |
+| Provisioning unit/race tests | Passed; 83.1% statement coverage in the recorded run | Complete adversarial filesystem or crash-consistency coverage. |
+| Repository Go race tests and `go vet` | Passed with Go 1.26.9 on macOS ARM64 | Execution of Linux-only packages, kernel behavior on every distribution, or production load capacity. |
+| Linux ARM64 namespace test in Colima | Passed with real kernel WireGuard | Customer Ubuntu acceptance, internet forwarding, VPN coexistence, or WAN quality. |
+| Bidirectional tunnel traffic | Three ICMP requests each direction received in the recorded test | Statistical reliability, sustained throughput, or application SLO improvement. |
+| Handshake check | Nonzero kernel handshake timestamp after traffic | Continuous handshake-age monitoring or automatic gateway failover. |
+| Runtime peer removal | Subsequent test traffic failed as expected | Durable device revocation across service restart. |
+| Identity/configuration overwrite attempts | Rejected | Automated migration, rotation, or upgrade recovery. |
+| Go vulnerability scan after toolchain upgrade | Zero reachable findings; one uncalled module-level advisory in the recorded host scan | A clean image/OS scan, Linux-specific scan, penetration test, or permanent absence of vulnerabilities. |
+| Hosted Linux CI | Workflow added | A successful hosted run; results must be checked after publication. |
+
+Go 1.26.2 produced reachable standard-library advisories in the earlier scan. The module and container build baseline were raised to Go 1.26.9 and the scan repeated. Later releases must rerun vulnerability checks and use a supported patched toolchain; this historical result is not a security certification.
+
+### Reproducible Linux Test Boundary
+
+`deploy/wireguard/integration.sh` refuses to replace existing named test namespaces, creates client and gateway namespaces linked by a veth underlay, generates separate local identities, and loads the generated peer configuration using WireGuard tools. Explicit test routes carry packets through the tunnel. After handshake and bidirectional traffic checks, removing the gateway peer must prevent further traffic. An exit trap removes test namespaces and temporary key material; abnormal host termination can still require manual cleanup.
+
+The disposable container has no external network and requires extra namespace capabilities. These are test-only permissions, not production service settings. On macOS/Colima, place the static Linux ARM64 binary under a shared `/Users` path: macOS `/tmp` is not necessarily shared with the VM. Use `CGO_ENABLED=0` for the Alpine test image. See the runbook for exact commands.
+
+The existing `deploy/lab` scenario separately demonstrates controlled primary-path impairment and manually selected recovery. Neither lab proves automatic per-application failover or a customer outcome. End-to-end enforcer failure, reboot, DNS expiry, QoS, gateway ACL/NAT, and customer network tests remain release gates.
+
 ## Production Target Architecture
+
+An initial operator-managed WireGuard provisioning slice is now implemented in `cmd/wireguard-provision` and `internal/wireguard`. It creates persistent local keys and validated no-overwrite configurations; the [Linux pilot runbook](deploy/wireguard/README.md) describes its acceptance test and limits. This narrows the manual configuration gap but does not implement remote enrollment, gateway forwarding, credential rotation, or production service operation.
 
 This section describes the target architecture required to operate PulseRoute as a paid, organization-managed service. It is a design target, not a statement that the components below are implemented in this repository. The current implementation remains a Linux-first prototype with a local, in-memory control plane and a fail-open enforcer.
 
@@ -547,6 +694,8 @@ Each mapping must contain the policy rule, IP address family, observed time, bou
 
 The first production release should limit routing to explicit customer-approved hostname suffixes and destination ports, use conservative TTLs, and report ambiguous mappings rather than routing them. It must retain the current privacy boundary: no packet payload collection, browser history, or unrestricted DNS history.
 
+Encrypted DNS, TLS Encrypted ClientHello, QUIC behavior, IP literals, shared CDNs, and changing DNS answers limit what a passive collector can establish. There is no universal DNS/SNI-to-application classifier. The initial collector design should prefer an organization-managed resolver or explicit application integration, report unclassified flows, and never weaken TLS or capture credentials to recover hidden names. A hostname-to-IP mapping can affect other applications sharing that IP; destination-port or platform application identity constraints require new enforcement support, not merely a policy-document field.
+
 ## Gateway Data Plane
 
 ### Gateway Responsibilities
@@ -582,6 +731,21 @@ Failover must use hysteresis and a minimum dwell time to prevent route flapping.
 ### Fail-Open Default
 
 The existing Linux behavior is fail-open and remains the default for early deployments. When the agent, policy, or overlay is unhealthy, PulseRoute-owned packet state is removed and traffic follows the operating system's normal route. This is appropriate when the overlay is an optimization feature and direct access is permitted by the organization's VPN/SSE policy.
+
+### Current Failure Detection Matrix
+
+The statement above is the intended fail-open policy, not evidence that every failure is currently detected. The implemented watchdog boundary is narrower:
+
+| Event | Current behavior | Required production follow-up |
+| --- | --- | --- |
+| Agent readiness fails or WireGuard device disappears | Watchdog removes PulseRoute-owned routing/QoS state. | Verify recovery, reboot, systemd ordering, and coexistence with customer VPN/firewall rules. |
+| Gateway stops responding while the local interface remains | Device-existence check can still pass; traffic may remain assigned to an unusable tunnel. | Handshake-age checks, encrypted active probes, bounded detection time, and tested route recovery. |
+| Policy cache expires and refresh fails | New decisions cannot use an unavailable snapshot; readiness can cause watchdog rollback. | Signed last-known-good validity, explicit expiry/failure policy, and outage tests. |
+| Metrics rejects a credential or storage is unavailable | Publication fails; selection state is not reversed and no route command is issued. | Alerting, credential rollout, bounded retries, and telemetry-gap visibility. |
+| Path probe stops | No new measurement cycle; it is not a watchdog health input. | Measurement freshness in selection and reconciliation; no implied continuous optimization. |
+| Enforcer destination mapping expires | The timed destination entry no longer marks that IP. | Trusted refresh/removal lifecycle tied to policy and authoritative mapping expiry. |
+| Tunnel-only protection is requested | Unsupported; current fail-open behavior cannot supply a security kill switch. | Opt-in signed policy, persistence, bootstrap exceptions, and IPv4/IPv6 leak tests. |
+| Runtime WireGuard peer is removed | The tested encrypted exchange stops, but the persisted peer file is unchanged. | Durable authorization and revocation reconciliation before production enrollment claims. |
 
 ### Fail-Closed Is an Opt-In Security Policy
 
@@ -658,7 +822,7 @@ The production test suite must extend beyond unit tests:
 ### Staged Customer Rollout
 
 1. Run an internal dogfood cohort in observe mode. Verify endpoint installation, policy accuracy, telemetry quality, privacy controls, support workflows, and gateway capacity.
-2. Run a design-partner pilot with ten to twenty-five managed Linux devices and one or two explicitly approved application groups. Keep the default failure mode fail-open.
+2. Begin an assisted evaluation with two to five noncritical Linux devices and reviewed explicit destinations. Only expand to a ten-to-twenty-five-device optimization pilot after gateway controls and the required discovery/enforcement integration are accepted. Keep the default failure mode fail-open.
 3. Compare matched direct and overlay measurements over equivalent time windows. Publish no savings or quality claim without retained source measurements and a documented comparison method.
 4. Expand to a controlled paid cohort only after enrollment, key rotation, gateway failover, policy rollback, incident response, and support escalation exercises succeed.
 5. Enable fail-closed only for customers and destination classes that completed the dedicated acceptance tests and approved the bootstrap allowlist.
@@ -668,17 +832,21 @@ Each phase must define entry criteria, exit criteria, owner, rollback action, an
 
 ## Commercialization Model
 
-PulseRoute should be sold initially as a managed remote-connectivity optimization service for customers that permit an approved overlay and can identify a small set of performance-sensitive SaaS or private applications. It should not be marketed as a VPN bypass, a security-service replacement, or a guarantee that every application will improve.
+The future product is a managed remote-connectivity optimization service for customers that permit an approved overlay and can identify a small set of performance-sensitive SaaS or private applications. The current commercial starting point is a scoped assisted engineering evaluation, not that fully managed subscription. It must not be marketed as a VPN bypass, a security-service replacement, or a guarantee that every application will improve.
 
 ### Initial Paid Offer
 
-The first commercial offer should be a time-bounded paid pilot with a clear operational scope:
+The first commercial offer should be a time-bounded, fixed-fee assisted evaluation with a clear operational scope:
 
-- A defined Linux endpoint cohort, one or more gateway regions, and named supported application classes.
+- Two to five noncritical Linux endpoints, one customer-authorized test gateway, and reviewed explicit destinations.
 - Customer-owned identity, device-management, and approved split-routing or overlay authorization.
-- Baseline and post-rollout measurement plan, including the selected metrics, sample window, and success thresholds.
+- Baseline and post-change measurement plan, including equivalent workloads, selected metrics, sample window, and customer-defined success thresholds.
 - Named support contacts, an escalation path, maintenance window, data-retention terms, and a documented rollback procedure.
-- A per-managed-device subscription with a separately priced gateway, support, or reserved-capacity component when applicable.
+- A fixed evaluation fee, separately disclosed VM/egress costs, capped engineering/support effort, and agreed deliverables. Pricing is a customer-discovery hypothesis, not evidence of existing willingness to pay.
+
+Deliverables are an installation record, repeatable test evidence, observed limitations, a support/operating-cost estimate, and a customer go/no-go decision. The agreement must explicitly exclude unattended production operation, automatic application steering, fail-closed security guarantees, and availability commitments that are not implemented. Legal/security approval and a signed customer scope are prerequisites; writing this design does not create a commercial agreement.
+
+A per-managed-device subscription, optionally with gateway capacity and support charges, becomes an offer only after the managed-service release gates are met. No automated billing, payment processing, entitlements, invoicing, or subscription enforcement exists in the current product.
 
 Commercial success should be evaluated using deployment completion, active protected devices, gateway reliability, support burden, and verified application-experience outcomes. Do not use synthetic dashboard data, raw policy-selection counts, or manually seeded "avoided incidents" as revenue or customer-value evidence.
 
@@ -687,6 +855,41 @@ Commercial success should be evaluated using deployment completion, active prote
 Package tiers should correspond to real operating cost and support commitments, for example an assisted pilot, a managed production tier, and an enterprise tier with regional gateway options, SIEM export, SSO/RBAC integration, and contracted support objectives. Pricing must account for gateway egress, regional redundancy, telemetry storage, support staffing, and security/compliance operations rather than only endpoint-agent distribution.
 
 Customer responsibilities must be explicit: approving split-tunnel behavior, administering users and devices, supplying destination policy intent, validating application outcomes, and maintaining their identity/device-management systems. PulseRoute responsibilities must be equally explicit: service operation, endpoint and gateway updates, policy delivery, documented incident response, telemetry retention according to agreement, and support within the purchased tier.
+
+### Evaluation Funnel and Unit Economics
+
+Track prospective design partners, approved evaluation scopes, signed paid evaluations, accepted deliverables, renewal/expansion decisions, and reasons for rejection separately. A successful kernel test, dashboard selection, or trial signup is not recognized revenue. Revenue reporting requires actual customer agreements and the applicable invoicing/accounting process.
+
+Estimate cost per active device from gateway compute, bandwidth, telemetry storage, operational overhead, and support effort at the expected cohort size. Track engineering onboarding effort separately from recurring costs. Do not quote a sustainable subscription price until those costs and willingness to pay have been measured. A single-region evaluation may be economical but cannot support a redundant regional availability promise.
+
+### Commercial Acceptance Evidence
+
+Before expanding a paid evaluation, obtain customer sign-off on approved routes/destinations, test results, observed regressions, privacy handling, support responsiveness, rollback evidence, and the proposed next-phase scope. A valid result may be that the overlay does not improve the customer's workload. Preserve that result rather than reporting only favorable windows.
+
+Production sale additionally requires contracts covering responsibility boundaries, security/incident contacts, data processing and retention, service limitations, support hours, and any explicitly offered SLOs. No SLA, compliance certification, vendor compatibility certification, or application performance guarantee should be inferred from this repository.
+
+## Delivery Milestones and Open Decisions
+
+| Milestone | Present state | Exit evidence and owner |
+| --- | --- | --- |
+| Local provisioning foundation | Implemented and tested | Engineering: reviewed plans, safe key handling, unit/race/static checks, Linux namespace proof. |
+| Repeatable release validation | CI definition added; hosted run pending | Release owner: successful Linux CI run, patched dependencies, artifact provenance and signature verification. |
+| Assisted customer evaluation | Not deployed | Customer administrator and engineering: approved Ubuntu endpoint/gateway, firewall and management access review, signed scope, test/rollback record. |
+| Production tunnel lifecycle | Not implemented | Security and engineering: authenticated enrollment, durable peer inventory, revocation, rotation, recovery, and signed updates. |
+| Application-aware optimization | Partial decision/routing components only | Networking: authoritative classification, bounded expiry, measured health, route reconciliation, real application outcomes. |
+| Managed subscription | Not implemented | Operations and commercial owner: release/security gates, support capacity, customer acceptance, billing and operating-cost model. |
+
+Before moving beyond the isolated proof, record the target Ubuntu release/kernel and architecture, machine ownership, gateway location, address plan, approved destinations/ports, identity authority, management access, retention terms, and explicit failure mode. Choose narrow operator-managed IPv4 routing for the current evaluation; do not silently treat it as tunnel-only protection or all-platform support.
+
+Cloud/VM provisioning and production firewall changes require an approved target and change plan. No cloud account, hostname, certificate authority, public gateway, customer credential, pricing agreement, or support commitment is invented by this design. These are deployment and commercial decisions, not missing configuration defaults to guess.
+
+### Compatibility and Rollback Rules
+
+- Keep ingestion authentication opt-in for existing local users. Any future requirement for authenticated production ingestion must be an explicit deployment profile/version gate with a migration period.
+- Add new API fields as optional, retain existing endpoint semantics, and version behavior changes. Do not reinterpret current `direct-internet` decisions as a security authorization in place.
+- Introduce durable schemas additively, backfill through reviewed migrations, and defer destructive changes until older clients have migrated.
+- Keep last-known-good binaries, policies, and approved network configurations under controlled access. Document which state each rollback owns and how credentials/revocations remain valid after rollback.
+- Never restore a revoked device merely to roll back software. Never disable authentication on an exposed service or turn off the corporate VPN as a troubleshooting shortcut.
 
 ## Production Readiness Exit Criteria
 

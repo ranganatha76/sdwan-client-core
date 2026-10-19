@@ -1,0 +1,4 @@
+FROM alpine:3.23
+RUN apk add --no-cache bash iproute2 iputils wireguard-tools
+COPY integration.sh /tests/integration.sh
+ENTRYPOINT ["bash", "/tests/integration.sh"]

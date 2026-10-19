@@ -1,6 +1,8 @@
 package telemetry
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"io"
 	"log"
@@ -22,6 +24,25 @@ func NewHandler(writer *InfluxWriter) http.Handler {
 	mux.HandleFunc("POST /v1/application-experience", server.writeApplicationExperience)
 	mux.HandleFunc("POST /v1/route-decisions", server.writeRouteDecision)
 	return mux
+}
+
+func NewAuthenticatedHandler(writer *InfluxWriter, token string) http.Handler {
+	handler := NewHandler(writer)
+	if token == "" {
+		return handler
+	}
+	expected := sha256.Sum256([]byte("Bearer " + token))
+	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodPost {
+			provided := sha256.Sum256([]byte(request.Header.Get("Authorization")))
+			if subtle.ConstantTimeCompare(provided[:], expected[:]) != 1 {
+				response.Header().Set("WWW-Authenticate", "Bearer")
+				http.Error(response, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		handler.ServeHTTP(response, request)
+	})
 }
 
 // httpServer owns HTTP-specific dependencies for the telemetry service endpoints.

@@ -49,6 +49,9 @@ func (s *server) reportPathMetrics(state clientState) {
 			continue
 		}
 		request.Header.Set("Content-Type", "application/json")
+		if s.metricsAuthToken != "" {
+			request.Header.Set("Authorization", "Bearer "+s.metricsAuthToken)
+		}
 		response, err := s.metricsClient.Do(request)
 		if err != nil {
 			logTelemetryFailure("report metrics", app.ID, err)
@@ -101,6 +104,9 @@ func (s *server) reportRouteDecision(app application, paths []path) {
 		return
 	}
 	request.Header.Set("Content-Type", "application/json")
+	if s.metricsAuthToken != "" {
+		request.Header.Set("Authorization", "Bearer "+s.metricsAuthToken)
+	}
 	response, err := s.metricsClient.Do(request)
 	if err != nil {
 		logTelemetryFailure("report route decision", app.ID, err)

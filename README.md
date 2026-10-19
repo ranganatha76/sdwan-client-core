@@ -27,7 +27,7 @@ When a corporate VPN is full-tunnel, PulseRoute must retain that VPN as the requ
 
 ## Prerequisites
 
-- Go 1.26 or newer
+- Go 1.26.9 or newer patched release
 
 ## Run locally
 
@@ -48,6 +48,8 @@ go test ./...
 ```
 
 ## Zero-Cost Performance Lab
+
+For the first Linux managed-tunnel slice, see the [WireGuard provisioning and assisted-pilot runbook](deploy/wireguard/README.md). It covers persistent local identities, validated peer configurations, a real Linux kernel test, rollback, and commercial acceptance gates. It is not an automatic enrollment service or a production-readiness certification.
 
 Use the [Linux namespace lab](deploy/lab/README.md) on a Linux VM to create two ephemeral WireGuard paths, impair the primary path with `tc netem`, select the healthy backup path, and capture baseline/degraded/recovered latency and loss. It uses only Linux networking tools and temporary in-memory keys; it does not require a paid VPN or SSE provider.
 
@@ -80,6 +82,14 @@ python3 start_up.py
 This creates three distinct 256-bit local secrets without printing them. `.env` is ignored by Git and must never be committed. Use `python3 start_up.py --skip-build` to reuse existing images. The launcher starts the browser UI, control plane, policy service, data-plane decision agent, InfluxDB, metrics service, and Grafana. It does not install or start the platform-native Linux enforcer or macOS Packet Tunnel because those require separately provisioned operating-system privileges, WireGuard gateway settings, and Apple entitlement/signing.
 
 The UI service is available at http://localhost:8080, Grafana at http://localhost:3000, the data-plane decision API on loopback at http://localhost:8082, and metrics ingestion on loopback at http://localhost:8083. InfluxDB retains performance data for seven days. Grafana automatically provisions the `PulseRoute Performance` dashboard and its InfluxDB data source. The Compose stack runs every custom Go service as non-root with a read-only filesystem and no Linux capabilities. Compose health checks require the control plane, policy snapshot, and InfluxDB before dependent services are treated as ready.
+
+## Telemetry Ingestion Authentication
+
+Before a managed pilot, set `METRICS_AUTH_TOKEN` in the local environment file to a distinct random value of at least 32 characters. Compose passes it to the metrics server and control-plane publisher. Supply the same environment variable to the Linux telemetry collector through its approved service configuration, not a command-line argument. Other telemetry clients must send `Authorization: Bearer <credential>` for all five ingestion POST endpoints.
+
+An absent or incorrect credential returns `401` when authentication is enabled. Health/readiness checks remain accessible. Empty configuration preserves legacy local-development behavior; it is not a production security setting. Keep host ports bound to loopback, and use TLS or an authenticated encrypted transport for any remote ingestion. Bearer authentication alone does not encrypt telemetry or establish device/tenant identity.
+
+Rotate the credential by coordinating publishers and the metrics server in a maintenance window; the current implementation accepts only one credential at a time. To roll back this opt-in feature in a controlled local environment, clear the setting on the server and publishers and recreate those services. Do not disable authentication on an exposed service.
 
 ## UI Service
 

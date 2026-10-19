@@ -10,18 +10,20 @@ import (
 
 // server owns the in-memory routing state and its external dependencies.
 type server struct {
-	mu            sync.RWMutex
-	state         clientState
-	metricsURL    string
-	metricsClient *http.Client
+	mu               sync.RWMutex
+	state            clientState
+	metricsURL       string
+	metricsAuthToken string
+	metricsClient    *http.Client
 }
 
 // newServer creates the control-plane with an unmeasured initial state.
 func newServer() *server {
 	return &server{
-		state:         initialState(),
-		metricsURL:    os.Getenv("METRICS_URL"),
-		metricsClient: &http.Client{Timeout: 5 * time.Second},
+		state:            initialState(),
+		metricsURL:       os.Getenv("METRICS_URL"),
+		metricsAuthToken: os.Getenv("METRICS_AUTH_TOKEN"),
+		metricsClient:    &http.Client{Timeout: 5 * time.Second},
 	}
 }
 

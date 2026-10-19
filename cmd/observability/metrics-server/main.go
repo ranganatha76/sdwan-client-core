@@ -22,7 +22,7 @@ func main() {
 	})
 	server := &http.Server{
 		Addr:              ":8083",
-		Handler:           telemetry.NewHandler(writer),
+		Handler:           telemetry.NewAuthenticatedHandler(writer, os.Getenv("METRICS_AUTH_TOKEN")),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
