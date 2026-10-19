@@ -56,6 +56,7 @@ func main() {
 	client := &policyClient{url: serviceURL, token: token, httpClient: &http.Client{Timeout: 3 * time.Second}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", health)
+	mux.HandleFunc("GET /readyz", client.ready)
 	mux.HandleFunc("POST /v1/flows/evaluate", client.evaluate(mode))
 	server := &http.Server{Addr: ":8082", Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
 	log.Printf("data-plane agent listening on :8082 in %s mode", mode)
@@ -64,6 +65,15 @@ func main() {
 
 // health reports that the data-plane agent is available.
 func health(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ready confirms that a policy snapshot is available before accepting flow decisions.
+func (c *policyClient) ready(w http.ResponseWriter, r *http.Request) {
+	if _, err := c.getSnapshot(r.Context()); err != nil {
+		http.Error(w, "policy unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

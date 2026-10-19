@@ -7,6 +7,11 @@ services:
         TARGET: ./cmd/control-plane
     expose:
       - "8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
     read_only: true
     tmpfs:
       - /tmp
@@ -25,7 +30,8 @@ services:
     environment:
       CONTROL_PLANE_URL: http://control-plane:8080
     depends_on:
-      - control-plane
+      control-plane:
+        condition: service_healthy
     ports:
       - "127.0.0.1:8080:8080"
     read_only: true
@@ -89,7 +95,7 @@ services:
     cap_drop:
       - ALL
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8082/healthz"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8082/readyz"]
       interval: 10s
       timeout: 3s
       retries: 3
@@ -109,6 +115,11 @@ services:
       - influx-data:/var/lib/influxdb2
     expose:
       - "8086"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8086/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
     restart: unless-stopped
 
   metrics-server:
@@ -123,7 +134,8 @@ services:
       INFLUX_ORG: pulseroute
       INFLUX_BUCKET: performance
     depends_on:
-      - timeseries-db
+      timeseries-db:
+        condition: service_healthy
     ports:
       - "127.0.0.1:8083:8083"
     read_only: true
@@ -133,17 +145,24 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8083/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
     restart: unless-stopped
 
   grafana:
     image: grafana/grafana:11.6.0
     environment:
       GF_SERVER_ROOT_URL: http://localhost:3000
-      GF_SECURITY_ADMIN_PASSWORD: ${INFLUXDB_ADMIN_TOKEN:?set INFLUXDB_ADMIN_TOKEN in .env}
+      GF_SECURITY_ADMIN_USER: pulseroute-admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
     ports:
       - "127.0.0.1:3000:3000"
     depends_on:
-      - timeseries-db
+      timeseries-db:
+        condition: service_healthy
     volumes:
       - grafana-data:/var/lib/grafana
     restart: unless-stopped

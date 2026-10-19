@@ -25,7 +25,13 @@ sudo /usr/local/sbin/pulseroute-enforcer install
 sudo /usr/local/sbin/pulseroute-enforcer --hostname api.github.com --destination-ip 140.82.112.6 evaluate
 ```
 
-The adapter must be operated with a health watchdog that removes its nftables table and `ip rule` when the WireGuard tunnel or local agent is unavailable. That watchdog and the authoritative DNS/SNI flow collector are not implemented yet.
+`evaluate` changes the nftables destination set only when the agent returns both `action: priority-overlay` and `mode: enforce`; it is inert in observe mode. Roll back routing explicitly with:
+
+```sh
+sudo /usr/local/sbin/pulseroute-enforcer uninstall
+```
+
+The adapter must be operated with a health watchdog that runs the rollback when the WireGuard tunnel or local agent is unavailable. That watchdog and the authoritative DNS/SNI flow collector are not implemented yet.
 
 ## macOS
 

@@ -54,6 +54,7 @@ type server struct {
 func main() {
 	s := &server{state: initialState()}
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", health)
 	mux.HandleFunc("GET /api/state", s.getState)
 	mux.HandleFunc("POST /api/policies/enable-all", s.enableAllPolicies)
 	mux.HandleFunc("POST /api/policies/", s.togglePolicy)
@@ -63,6 +64,11 @@ func main() {
 
 	log.Println("SD-WAN client listening on http://localhost:8080")
 	log.Fatal(http.ListenAndServe(":8080", mux))
+}
+
+// health reports that the control-plane process can accept requests.
+func health(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // initialState creates the dashboard's default protected applications and paths.

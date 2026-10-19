@@ -43,6 +43,7 @@ func main() {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", health)
+	mux.HandleFunc("GET /readyz", writer.ready)
 	mux.HandleFunc("POST /v1/measurements", writer.writeMeasurement)
 	server := &http.Server{Addr: ":8083", Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second}
 	log.Println("metrics server listening on :8083")
@@ -61,6 +62,27 @@ func requiredEnv(name string) string {
 // health reports that the metrics service is ready to receive measurements.
 func health(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// ready verifies that InfluxDB is reachable before the service advertises ingestion readiness.
+func (w *influxWriter) ready(response http.ResponseWriter, request *http.Request) {
+	endpoint := strings.TrimRight(w.url, "/") + "/health"
+	influxRequest, err := http.NewRequestWithContext(request.Context(), http.MethodGet, endpoint, nil)
+	if err != nil {
+		http.Error(response, "metrics storage unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	influxResponse, err := w.client.Do(influxRequest)
+	if err != nil {
+		http.Error(response, "metrics storage unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	defer influxResponse.Body.Close()
+	if influxResponse.StatusCode != http.StatusOK {
+		http.Error(response, "metrics storage unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	response.WriteHeader(http.StatusNoContent)
 }
 
 // writeMeasurement validates a measurement request and persists it to InfluxDB.

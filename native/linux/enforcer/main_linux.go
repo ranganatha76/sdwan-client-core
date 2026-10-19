@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/exec"
 	"regexp"
@@ -33,6 +34,7 @@ type flowRequest struct {
 
 type decision struct {
 	Action string `json:"action"`
+	Mode   string `json:"mode"`
 }
 
 var interfaceName = regexp.MustCompile(`^[a-zA-Z0-9_.-]{1,15}$`)
@@ -43,8 +45,8 @@ func main() {
 	hostname := flag.String("hostname", "", "hostname associated with the destination")
 	destinationIP := flag.String("destination-ip", "", "destination IP address")
 	flag.Parse()
-	if flag.NArg() != 1 || (flag.Arg(0) != "install" && flag.Arg(0) != "evaluate") {
-		fmt.Fprintln(os.Stderr, "usage: pulseroute-enforcer [--config PATH] [--hostname HOST --destination-ip IP] install|evaluate")
+	if flag.NArg() != 1 || (flag.Arg(0) != "install" && flag.Arg(0) != "uninstall" && flag.Arg(0) != "evaluate") {
+		fmt.Fprintln(os.Stderr, "usage: pulseroute-enforcer [--config PATH] [--hostname HOST --destination-ip IP] install|uninstall|evaluate")
 		os.Exit(2)
 	}
 	config, err := loadConfig(*configPath)
@@ -58,9 +60,19 @@ func main() {
 		fatal(install(context.Background(), config))
 		return
 	}
+	if flag.Arg(0) == "uninstall" {
+		if os.Geteuid() != 0 {
+			fatal(errors.New("uninstall requires root"))
+		}
+		fatal(uninstall(context.Background(), config))
+		return
+	}
 
 	if *hostname == "" || *destinationIP == "" {
 		fatal(errors.New("evaluate requires --hostname and --destination-ip"))
+	}
+	if err := validateDestinationIPv4(*destinationIP); err != nil {
+		fatal(err)
 	}
 	fatal(evaluate(context.Background(), config, *hostname, *destinationIP))
 }
@@ -83,16 +95,36 @@ func loadConfig(path string) (Config, error) {
 
 // install creates a dedicated mark, nftables destination set, and WireGuard route table.
 func install(ctx context.Context, config Config) error {
+	if err := ensureNftObject(ctx, []string{"table", "inet", "pulseroute"}, []string{"add", "table", "inet", "pulseroute"}); err != nil {
+		return err
+	}
+	if err := ensureNftObject(ctx, []string{"set", "inet", "pulseroute", "priority_destinations"}, []string{"add", "set", "inet", "pulseroute", "priority_destinations", "{", "type", "ipv4_addr", ";", "flags", "timeout", ";", "}"}); err != nil {
+		return err
+	}
+	if err := ensureNftObject(ctx, []string{"chain", "inet", "pulseroute", "output"}, []string{"add", "chain", "inet", "pulseroute", "output", "{", "type", "route", "hook", "output", "priority", "mangle", ";", "policy", "accept", ";", "ip", "daddr", "@priority_destinations", "meta", "mark", "set", fmt.Sprint(config.FirewallMark), ";", "}"}); err != nil {
+		return err
+	}
 	commands := [][]string{
 		{"ip", "route", "replace", "default", "dev", config.WireGuardDevice, "table", fmt.Sprint(config.RouteTable)},
 		{"ip", "rule", "replace", "fwmark", fmt.Sprint(config.FirewallMark), "lookup", fmt.Sprint(config.RouteTable)},
-		{"nft", "add", "table", "inet", "pulseroute"},
-		{"nft", "add", "set", "inet", "pulseroute", "priority_destinations", "{", "type", "ipv4_addr", ";", "flags", "timeout", ";", "}"},
-		{"nft", "add", "chain", "inet", "pulseroute", "output", "{", "type", "route", "hook", "output", "priority", "mangle", ";", "policy", "accept", ";", "ip", "daddr", "@priority_destinations", "meta", "mark", "set", fmt.Sprint(config.FirewallMark), ";", "}"},
 	}
 	for _, command := range commands {
 		if err := run(ctx, command[0], command[1:]...); err != nil {
 			return fmt.Errorf("install %s: %w", strings.Join(command, " "), err)
+		}
+	}
+	return nil
+}
+
+// uninstall removes only the route and firewall objects owned by this adapter.
+func uninstall(ctx context.Context, config Config) error {
+	for _, command := range [][]string{
+		{"nft", "delete", "table", "inet", "pulseroute"},
+		{"ip", "rule", "delete", "fwmark", fmt.Sprint(config.FirewallMark), "lookup", fmt.Sprint(config.RouteTable)},
+		{"ip", "route", "flush", "table", fmt.Sprint(config.RouteTable)},
+	} {
+		if err := run(ctx, command[0], command[1:]...); err != nil {
+			return fmt.Errorf("uninstall %s: %w", strings.Join(command, " "), err)
 		}
 	}
 	return nil
@@ -121,13 +153,38 @@ func evaluate(ctx context.Context, config Config, hostname, destinationIP string
 	if err := json.NewDecoder(io.LimitReader(response.Body, 16<<10)).Decode(&result); err != nil {
 		return err
 	}
-	if result.Action != "priority-overlay" {
+	if !shouldMark(result) {
 		return nil
 	}
 	if os.Geteuid() != 0 {
 		return errors.New("priority decision received, but adding an nftables destination requires root")
 	}
 	return run(ctx, "nft", "add", "element", "inet", "pulseroute", "priority_destinations", "{", destinationIP, "timeout", "10m", "}")
+}
+
+// shouldMark permits operating-system route changes only for an enforce-mode priority decision.
+func shouldMark(result decision) bool {
+	return result.Mode == "enforce" && result.Action == "priority-overlay"
+}
+
+// validateDestinationIPv4 rejects malformed and IPv6 input because the nftables set is IPv4-only.
+func validateDestinationIPv4(destinationIP string) error {
+	address, err := netip.ParseAddr(destinationIP)
+	if err != nil || !address.Is4() {
+		return errors.New("destination-ip must be a valid IPv4 address")
+	}
+	return nil
+}
+
+// ensureNftObject creates an nftables object only if it is not already present.
+func ensureNftObject(ctx context.Context, lookup, create []string) error {
+	if err := run(ctx, "nft", append([]string{"list"}, lookup...)...); err == nil {
+		return nil
+	}
+	if err := run(ctx, "nft", create...); err != nil {
+		return fmt.Errorf("create nft %s: %w", strings.Join(lookup, " "), err)
+	}
+	return nil
 }
 
 // run invokes one fixed system command without a shell.
