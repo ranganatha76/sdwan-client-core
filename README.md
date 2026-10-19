@@ -93,6 +93,9 @@ docker compose -f deploy/docker-compose.yml down
 | `POST` | `/api/connection` | Pause or resume SD-WAN protection. |
 | `POST` | `http://localhost:8082/v1/flows/evaluate` | Decide whether an observed hostname should use the priority overlay or normal internet. |
 | `POST` | `http://localhost:8083/v1/endpoint-telemetry` | Store observe-only endpoint network and VPN health for Grafana. |
+| `POST` | `http://localhost:8083/v1/endpoint-diagnostics` | Store observe-only interface, reachability, and resource diagnostics. |
+| `POST` | `http://localhost:8083/v1/application-experience` | Store supported application SLO outcomes before and after a route decision. |
+| `POST` | `http://localhost:8083/v1/route-decisions` | Store a policy decision, its reason, rollback outcome, and candidate paths. |
 
 ### Dashboard control API
 
@@ -118,6 +121,12 @@ curl -X POST http://localhost:8083/v1/endpoint-telemetry \
 ```
 
 The `PulseRoute Performance` Grafana dashboard includes endpoint VPN-state and latency/jitter panels after samples are submitted.
+
+### Application Experience and Explainability
+
+PulseRoute accepts the following application SLOs: `zoom_jitter_ms`, `zoom_loss_pct`, `teams_rtt_ms`, `git_transfer_duration_ms`, `github_transfer_duration_ms`, and `slack_reconnect_count`. An application experience record compares baseline, optimized, and target values and marks whether a decision avoided an SLO incident. A related route-decision record stores the application, destination class, policy ID, selected and rejected candidate paths, reason, result, and rollback event. It never stores hostnames or packet content.
+
+Grafana now shows the before/after/target SLO values, avoided-incident count, and candidate-path scores. Decision IDs correlate the two record types as fields instead of InfluxDB tags to avoid unbounded series cardinality.
 
 ### Flow-decision API
 

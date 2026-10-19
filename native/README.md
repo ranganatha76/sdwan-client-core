@@ -41,6 +41,19 @@ sudo systemctl enable --now pulseroute-enforcer
 
 The watchdog runs the rollback when the WireGuard device or local agent is unavailable. It checks device availability only; configure WireGuard `PersistentKeepalive` and external gateway health monitoring for stronger peer-path detection. An authoritative DNS/SNI flow collector is not implemented yet.
 
+### Endpoint telemetry collector
+
+`linux/telemetry` is an independent, observe-only Linux command. It does not invoke the enforcer or modify routes, QoS, WireGuard, DNS, or firewall state. It reports coarse local metadata: active interface category and changes, VPN-interface availability, default-route availability, aggregate CPU load and available memory, optional Wi-Fi signal strength, optional DNS/TLS reachability, and optional ICMP loss/latency/jitter.
+
+Build it on Linux, then run a one-time sample with only organization-approved probe targets:
+
+```sh
+go build -o pulseroute-telemetry ./native/linux/telemetry
+./pulseroute-telemetry --device-id managed-laptop-42 --vpn-provider cisco-anyconnect --vpn-interface-prefix tun --dns-host resolver.example.net --tls-host gateway.example.net --probe-host probe.example.net once
+```
+
+Use `watch` with `--interval 30s` for continuous collection. Probe target names remain local configuration and are never sent to the metrics API. The collector does not collect packet payloads, DNS query history, destination history, SSID/BSSID, gateway addresses, process names, commands, or user activity. Start in observe-only mode; route enforcement remains a separately approved Linux enforcer deployment.
+
 ## macOS
 
 `macos/PulseRoute.xcodeproj` contains a host application and Packet Tunnel Network Extension target. The host application supplies hostname metadata through `handleAppMessage`; the extension calls the local Go agent and returns the decision to the host app.

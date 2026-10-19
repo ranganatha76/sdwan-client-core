@@ -57,11 +57,13 @@ cmd/
   control-plane/                    Dashboard control state and APIs
     policy-service/                 Authenticated policy snapshot provider
   data-plane/agent/                 Flow-decision API for native adapters
-  observability/metrics-server/     Performance and bandwidth ingestion
+  observability/metrics-server/     Metrics composition root and server lifecycle
 internal/policy/                    Shared policy snapshot and hostname matching
+internal/telemetry/                 Typed models, validation, HTTP API, and InfluxDB writer
 deploy/                             Docker image, Compose stack, environment template
 native/
   linux/enforcer/                   Root-owned WireGuard route and QoS enforcer
+  linux/telemetry/                  Observe-only endpoint health collector
   linux/systemd/                    Fail-open enforcement watchdog unit
   macos/                            Host app and Packet Tunnel Xcode project
 CodeWalkThrough.md                  Service and request-flow guide
@@ -88,7 +90,9 @@ README.md                           Setup and API reference
 
 ### Observability
 
-`metrics-server` receives per-application baseline and optimized latency/loss plus bandwidth bytes. It writes `application_performance` points to InfluxDB. The `timeseries-db` bucket retains data for `168h`. Compose provisions Grafana's Flux datasource and a `PulseRoute Performance` dashboard with baseline versus optimized latency/loss, bandwidth by application, and latency-improvement panels.
+`cmd/observability/metrics-server` is deliberately a thin composition root. It reads InfluxDB configuration, creates `internal/telemetry.InfluxWriter`, and starts an HTTP server. `internal/telemetry` owns the typed telemetry models, validation, HTTP request decoding, InfluxDB line-protocol serialization, storage readiness checks, and tests. This keeps native collectors and future platform adapters on one contract rather than duplicating JSON schemas or storage code in each executable.
+
+The metrics API accepts five independent measurements: existing application path performance, endpoint quality, endpoint diagnostics, application SLO outcomes, and route-decision explanations. All writes are telemetry only; no metrics endpoint can alter policies, routes, WireGuard, QoS, VPN state, or a native adapter. The `timeseries-db` bucket retains data for `168h`. Compose provisions Grafana's Flux datasource and the `PulseRoute Performance` dashboard, which includes baseline/optimized application performance, endpoint VPN and quality views, SLO before/after/target values, avoided incidents, and candidate-path decision scores.
 
 ## API Contracts
 
@@ -116,6 +120,80 @@ A decision includes `action`, `priority`, optional `matchedRule`, `policyVersion
 | Method | Path | Request |
 | --- | --- | --- |
 | `POST` | `/v1/measurements` | Application, baseline/optimized latency and loss, bandwidth bytes. |
+| `POST` | `/v1/endpoint-telemetry` | Device/network/VPN state, aggregate path quality, interface byte counters. |
+| `POST` | `/v1/endpoint-diagnostics` | Coarse active-interface, route, optional probe, Wi-Fi signal, and host resource state. |
+| `POST` | `/v1/application-experience` | Supported application SLO baseline, optimized, target, and avoided-incident state. |
+| `POST` | `/v1/route-decisions` | Policy reason/result/rollback state and one selected path among candidate paths. |
+
+All telemetry writes return `202 Accepted` only after InfluxDB returns `204 No Content`. Invalid JSON, invalid tags, invalid quality ranges, unsupported SLO names, or ambiguous route decisions return `400 Bad Request`. Storage or readiness failures return `503 Service Unavailable`; callers own retry behavior. Request bodies are bounded to 16 KiB except route decisions, which allow 64 KiB for up to eight candidate paths.
+
+## Endpoint Experience Telemetry
+
+### Design Intent
+
+Endpoint experience telemetry is an **observe-only** diagnostic plane. It answers: “Was a supported work application measurably better after the control plane chose a path, and what local endpoint condition or candidate comparison explains that result?” It does not inspect application payloads, capture browsing history, or make enforcement decisions. The existing Linux enforcer remains the only native component capable of changing Linux packet state, and it remains separately installed, root-owned, and gated by `DATAPLANE_MODE=enforce`.
+
+The feature is intentionally staged:
+
+1. A collector records local health metadata and optional approved-probe results.
+2. The control plane records the candidate paths and policy reason after it accepts a full path-measurement cycle.
+3. An approved native or application-specific integration can submit a supported application SLO outcome.
+4. Grafana joins the time series by time, device, application, and the non-indexed decision correlation field for investigation.
+5. Operators review the evidence before a separate approved enforcement rollout changes traffic behavior.
+
+No application-specific SLO is fabricated by the control plane. Zoom/Teams/Git/Slack integrations must submit real measurements from an authorized source. This preserves the distinction between a routing decision, an endpoint probe, and an application experience claim.
+
+### Component and Data Flow
+
+```mermaid
+flowchart LR
+  Collector[Linux telemetry collector] -->|EndpointDiagnostics| Metrics[Metrics HTTP API]
+  Collector -->|Optional approved probe quality| Metrics
+  CP[Control plane] -->|Application performance and route explanations| Metrics
+  AppProbe[Approved app or native SLO integration] -->|ApplicationExperience| Metrics
+  Metrics -->|Typed validation| Telemetry[internal/telemetry]
+  Telemetry -->|Influx line protocol| Influx[(InfluxDB performance bucket)]
+  Grafana[Grafana] -->|Flux queries| Influx
+  Grafana --> Operator[Support and network operator]
+```
+
+`internal/telemetry` is the contract boundary. It defines models, validates data before serialization, provides the `net/http` handler, and persists accepted points through `InfluxWriter`. The metrics command does not own schemas or line protocol. The Linux collector imports the shared endpoint models, serializes them as JSON, and sends them to the loopback metrics API; it does not need InfluxDB credentials.
+
+The control plane emits route explanations only after a complete measurement cycle is validated and a best path is selected. It sends an application performance record and a separate route-decision record for every active application. Metrics delivery runs after the state lock is released and does not delay route selection. Failure to publish telemetry is logged; it cannot reverse, block, or alter the selected control-plane route.
+
+### Measurement Contracts and Influx Schema
+
+| Measurement | Tags | Fields | Producer | Purpose |
+| --- | --- | --- | --- | --- |
+| `application_performance` | `application` | Baseline/optimized latency and loss, bandwidth bytes | Control plane or approved adapter | Existing path-performance comparison. |
+| `endpoint_telemetry` | `device_id`, `network_type`, `vpn_provider` | VPN state, latency, jitter, loss, receive/transmit bytes | Linux collector with optional ICMP probe | Endpoint quality and VPN trend. |
+| `endpoint_diagnostics` | `device_id`, `network_type`, `active_interface`, `vpn_provider` | Interface change, default route, optional DNS/TLS, CPU load, memory, optional Wi-Fi dBm | Linux collector | Support triage for endpoint conditions. |
+| `application_experience` | `device_id`, `application`, `slo` | Baseline, optimized, target, avoided incident, decision ID | Approved application/native integration | SLO evidence before and after a decision. |
+| `route_decision` | `device_id`, `application`, `destination_class`, `policy_id`, `candidate_path` | Latency, jitter, loss, score, selected, decision ID, reason, result, rollback event | Control plane | Explain why one candidate won or a rollback occurred. |
+
+`decision_id`, `reason`, `result`, and `rollback_event` are InfluxDB fields, not tags. Decision IDs are high-cardinality by nature; using them as tags would create an unbounded series count. A single route-decision request creates one correlated Influx point per candidate path, all with the same timestamp and decision ID. Validation requires between one and eight candidates and exactly one `selected: true` value.
+
+Supported SLO names are explicitly allowlisted: `zoom_jitter_ms`, `zoom_loss_pct`, `teams_rtt_ms`, `git_transfer_duration_ms`, `github_transfer_duration_ms`, and `slack_reconnect_count`. The allowlist prevents arbitrary metric dimensions and makes alerts and Grafana units reviewable. Adding an SLO requires a source implementation, validation change, dashboard treatment, and documentation update.
+
+### Linux Collector Operation
+
+`native/linux/telemetry` builds `pulseroute-telemetry`, a Linux-only command with `once` and `watch` modes. It requires a stable managed `--device-id`, an administrator-supplied `--vpn-provider`, and a positive watch interval. Its default sink is `http://127.0.0.1:8083`, so endpoint data remains local to the host’s deployed PulseRoute stack before InfluxDB persistence.
+
+For each collection cycle, the collector reads the IPv4 default interface from `/proc/net/route`, derives only a coarse transport category, checks for a local VPN interface prefix, and reads aggregate load and available memory from procfs. It can optionally read Wi-Fi dBm through `iw` but never reads SSID, BSSID, channel, access-point identity, carrier identity, gateway address, or full route-table contents. Interface byte counters come from `/sys/class/net/<interface>/statistics` and are aggregate counters, not packet or flow samples.
+
+DNS, TLS, and ICMP probes are disabled unless the operator supplies `--dns-host`, `--tls-host`, or `--probe-host`. The configured target names remain local command configuration and are never included in the payload or persisted to InfluxDB. DNS produces only a boolean resolver result; TLS produces only a boolean TLS 1.2-or-newer handshake result; ICMP produces aggregate loss, average latency, and population-standard-deviation jitter from three packets. A fully lost ICMP probe is valid telemetry with `100%` loss. The collector never invokes the enforcer, changes routes, changes QoS, creates a tunnel, captures packets, or parses DNS/SNI application traffic.
+
+### Privacy and Security Boundary
+
+Collected and persisted metadata is intentionally limited to opaque device ID, coarse network type, interface name, VPN provider and availability, aggregate resource state, optional Wi-Fi signal strength, approved-probe booleans and aggregates, route-decision metadata, and approved application/SLO identifiers. The system does **not** collect or persist packet payloads, URLs, hostnames, DNS query history, destination history, SSIDs, BSSIDs, Wi-Fi channels, MAC addresses, gateway addresses, IP route entries, application content, process names, commands, keystrokes, or user activity.
+
+The metrics API validates all tag values against InfluxDB line-protocol separators, bounds string field values, bounds loss to 0 through 100, bounds Wi-Fi signal to plausible negative dBm values, and rejects negative counters or quality values. Native collector subprocesses use explicit arguments without a shell. Metrics endpoint health returns generic failures and never exposes backend credentials. In production, the loopback API must be protected by endpoint identity or mutually authenticated local IPC, and InfluxDB must use a scoped write token rather than the bootstrap administrator token.
+
+### Failure and Rollout Behavior
+
+Telemetry is non-blocking and fail-open. If InfluxDB is unavailable, the metrics API returns `503`; native collectors report the failure and retry on their next watch interval, while the control plane logs the failure and retains its already-selected state. A collector outage, malformed telemetry record, optional-probe failure, or Grafana outage cannot alter an endpoint route or disable ordinary internet access.
+
+Deployment should begin with a small managed cohort in `DATAPLANE_MODE=observe`, with no Linux enforcer installed. Operators should first verify collection rate, device identity quality, privacy review, metric completeness, Influx retention, dashboard usefulness, and support workflow. Only after SLO evidence, controlled gateway health checks, device enrollment, and rollback validation are available should a separately approved cohort move to native enforce mode. The telemetry collector does not become an enforcement prerequisite.
 
 ## Security Boundaries
 
@@ -124,6 +202,8 @@ A decision includes `action`, `priority`, optional `matchedRule`, `policyVersion
 - Custom Go containers run non-root with a read-only filesystem, `/tmp` tmpfs, dropped Linux capabilities, and `no-new-privileges`.
 - UI responses include `X-Content-Type-Options: nosniff` and `X-Frame-Options: DENY`.
 - Data-plane and metrics request bodies are size-limited before JSON decoding.
+- Endpoint diagnostics are metadata-only; approved probe targets remain local collector configuration and are not persisted.
+- Route-decision correlation IDs are storage fields rather than tags to prevent high-cardinality InfluxDB series growth.
 - TLS, device identity, policy signing, persistent audit logs, RBAC, and secret rotation remain production requirements.
 
 ## Deployment and Operations

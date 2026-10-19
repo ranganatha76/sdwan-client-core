@@ -303,6 +303,35 @@ type performanceMeasurement struct {
 	BandwidthBytes     int64   `json:"bandwidthBytes"`
 }
 
+// routeDecisionMeasurement represents the observable reason and path comparison for one application.
+// It mirrors the metrics service contract without granting the control plane additional enforcement power.
+// Candidate paths retain the current probe-derived quality values that informed the selected route.
+// DestinationClass remains an approved application category identifier rather than a hostname or URL.
+type routeDecisionMeasurement struct {
+	DecisionID       string          `json:"decisionId"`
+	DeviceID         string          `json:"deviceId"`
+	Application      string          `json:"application"`
+	DestinationClass string          `json:"destinationClass"`
+	PolicyID         string          `json:"policyId"`
+	Reason           string          `json:"reason"`
+	Result           string          `json:"result"`
+	RollbackEvent    string          `json:"rollbackEvent"`
+	CandidatePaths   []candidatePath `json:"candidatePaths"`
+}
+
+// candidatePath carries one probe-derived route candidate for an explainability record.
+// Name is normalized to a tag-safe identifier because the dashboard display name can contain spaces.
+// Quality values correspond to the control-plane state at the time the route decision was reported.
+// Selected identifies the one path that receives priority routing for the associated application.
+type candidatePath struct {
+	Name      string  `json:"name"`
+	LatencyMS float64 `json:"latencyMs"`
+	JitterMS  float64 `json:"jitterMs"`
+	LossPct   float64 `json:"lossPct"`
+	Score     int     `json:"score"`
+	Selected  bool    `json:"selected"`
+}
+
 // reportPathMetrics publishes per-application probe results to the optional metrics service.
 // It uses direct internet as a baseline and the selected path as the optimized result.
 // Failures are logged per application so one failed write does not stop later writes.
@@ -355,6 +384,44 @@ func (s *server) reportPathMetrics(state clientState) {
 		if response.StatusCode != http.StatusAccepted {
 			log.Printf("report metrics for %s: metrics server returned %s", app.ID, response.Status)
 		}
+		s.reportRouteDecision(app, state.Paths)
+	}
+}
+
+// reportRouteDecision publishes the candidate comparison that explains an active application's path choice.
+// It derives values from the accepted probe cycle and never invents application or endpoint measurements.
+// Failures are logged per application so observability cannot interrupt already-selected routing behavior.
+// The metrics service stores this as observe-only telemetry and does not execute an enforcement action.
+func (s *server) reportRouteDecision(app application, paths []path) {
+	candidates := make([]candidatePath, 0, len(paths))
+	for _, current := range paths {
+		loss, err := lossPercent(current.Loss)
+		if err != nil {
+			log.Printf("parse route-decision loss for %s: %v", current.Name, err)
+			return
+		}
+		candidates = append(candidates, candidatePath{Name: strings.ReplaceAll(strings.ToLower(current.Name), " ", "-"), LatencyMS: float64(current.Latency), JitterMS: float64(current.Jitter), LossPct: loss, Score: current.Score, Selected: current.Selected})
+	}
+	input := routeDecisionMeasurement{DecisionID: fmt.Sprintf("route-%d-%s", time.Now().UnixNano(), app.ID), DeviceID: "local-dashboard", Application: app.ID, DestinationClass: strings.ReplaceAll(strings.ToLower(app.Category), " ", "-"), PolicyID: app.ID, Reason: "highest-quality-score", Result: "selected", RollbackEvent: "none", CandidatePaths: candidates}
+	body, err := json.Marshal(input)
+	if err != nil {
+		log.Printf("marshal route decision for %s: %v", app.ID, err)
+		return
+	}
+	request, err := http.NewRequest(http.MethodPost, strings.TrimRight(s.metricsURL, "/")+"/v1/route-decisions", bytes.NewReader(body))
+	if err != nil {
+		log.Printf("create route decision request for %s: %v", app.ID, err)
+		return
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := s.metricsClient.Do(request)
+	if err != nil {
+		log.Printf("report route decision for %s: %v", app.ID, err)
+		return
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusAccepted {
+		log.Printf("report route decision for %s: metrics server returned %s", app.ID, response.Status)
 	}
 }
 
