@@ -50,10 +50,12 @@ type server struct {
 	state clientState
 }
 
+// main starts the local dashboard and registers its control-plane HTTP APIs.
 func main() {
 	s := &server{state: initialState()}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/state", s.getState)
+	mux.HandleFunc("POST /api/policies/enable-all", s.enableAllPolicies)
 	mux.HandleFunc("POST /api/policies/", s.togglePolicy)
 	mux.HandleFunc("POST /api/optimize", s.optimize)
 	mux.HandleFunc("POST /api/connection", s.toggleConnection)
@@ -63,6 +65,7 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8080", mux))
 }
 
+// initialState creates the dashboard's default protected applications and paths.
 func initialState() clientState {
 	// These defaults represent the centrally distributed work-traffic policy.
 	return clientState{
@@ -95,6 +98,7 @@ func initialState() clientState {
 	}
 }
 
+// getState returns a consistent snapshot for the dashboard to render.
 func (s *server) getState(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -102,11 +106,13 @@ func (s *server) getState(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(s.state)
 }
 
+// dashboard serves the embedded browser UI.
 func (s *server) dashboard(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(page))
 }
 
+// togglePolicy enables or disables one application's priority routing policy.
 func (s *server) togglePolicy(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/policies/"), "/toggle")
 	s.mu.Lock()
@@ -132,6 +138,24 @@ func (s *server) togglePolicy(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 
+// enableAllPolicies restores high-priority protection for every known application.
+func (s *server) enableAllPolicies(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	bestPath := selectedPath(s.state.Paths).Name
+	for index := range s.state.Apps {
+		app := &s.state.Apps[index]
+		app.Active = true
+		app.Priority = "High"
+		app.Health = "Protected"
+		app.Route = bestPath
+	}
+	s.addActivity("All application policies enabled", "success")
+	writeJSON(w, s.state)
+}
+
+// optimize selects the highest-scoring path and assigns protected apps to it.
 func (s *server) optimize(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -159,6 +183,7 @@ func (s *server) optimize(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, s.state)
 }
 
+// toggleConnection pauses or resumes the dashboard's protection state.
 func (s *server) toggleConnection(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -171,6 +196,7 @@ func (s *server) toggleConnection(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, s.state)
 }
 
+// addActivity prepends a bounded audit event to the dashboard activity feed.
 func (s *server) addActivity(message, kind string) {
 	s.state.Activity = append([]activity{{Time: time.Now().Format("15:04"), Message: message, Kind: kind}}, s.state.Activity...)
 	if len(s.state.Activity) > 4 {
@@ -178,6 +204,7 @@ func (s *server) addActivity(message, kind string) {
 	}
 }
 
+// selectedPath returns the path currently chosen for priority traffic.
 func selectedPath(paths []path) path {
 	for _, path := range paths {
 		if path.Selected {
@@ -187,6 +214,7 @@ func selectedPath(paths []path) path {
 	return paths[0]
 }
 
+// writeJSON serializes API responses with the expected content type.
 func writeJSON(w http.ResponseWriter, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(value)

@@ -32,6 +32,7 @@ type influxWriter struct {
 	client *http.Client
 }
 
+// main starts the metrics ingestion API that persists application measurements.
 func main() {
 	writer := &influxWriter{
 		url:    requiredEnv("INFLUX_URL"),
@@ -48,6 +49,7 @@ func main() {
 	log.Fatal(server.ListenAndServe())
 }
 
+// requiredEnv returns a required setting and stops startup when it is absent.
 func requiredEnv(name string) string {
 	value := os.Getenv(name)
 	if value == "" {
@@ -56,10 +58,12 @@ func requiredEnv(name string) string {
 	return value
 }
 
+// health reports that the metrics service is ready to receive measurements.
 func health(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// writeMeasurement validates a measurement request and persists it to InfluxDB.
 func (w *influxWriter) writeMeasurement(response http.ResponseWriter, request *http.Request) {
 	defer request.Body.Close()
 	var input measurement
@@ -75,10 +79,12 @@ func (w *influxWriter) writeMeasurement(response http.ResponseWriter, request *h
 	response.WriteHeader(http.StatusAccepted)
 }
 
+// valid rejects empty application names and negative or unsafe metric values.
 func (m measurement) valid() bool {
 	return m.Application != "" && !strings.ContainsAny(m.Application, ", =") && m.BaselineLatencyMS >= 0 && m.OptimizedLatencyMS >= 0 && m.BaselineLossPct >= 0 && m.OptimizedLossPct >= 0 && m.BandwidthBytes >= 0
 }
 
+// write converts a measurement into Influx line protocol and submits it.
 func (w *influxWriter) write(ctx context.Context, m measurement) error {
 	line := fmt.Sprintf("application_performance,application=%s baseline_latency_ms=%s,optimized_latency_ms=%s,baseline_loss_pct=%s,optimized_loss_pct=%s,bandwidth_bytes=%di %d", m.Application, decimal(m.BaselineLatencyMS), decimal(m.OptimizedLatencyMS), decimal(m.BaselineLossPct), decimal(m.OptimizedLossPct), m.BandwidthBytes, time.Now().UnixNano())
 	endpoint := w.url + "/api/v2/write?" + url.Values{"org": {w.org}, "bucket": {w.bucket}, "precision": {"ns"}}.Encode()
@@ -99,6 +105,7 @@ func (w *influxWriter) write(ctx context.Context, m measurement) error {
 	return nil
 }
 
+// decimal formats floating-point fields for Influx line protocol.
 func decimal(value float64) string {
 	return strconv.FormatFloat(value, 'f', -1, 64)
 }

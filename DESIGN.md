@@ -8,8 +8,9 @@ Provide a small, software-only SD-WAN client that gives work traffic priority ov
 
 ```mermaid
 flowchart LR
-    Browser[Local browser] -->|HTTP| Server[Go HTTP server]
-    Server --> State[In-memory UI state]
+    Browser[Local browser] -->|HTTP| UI[UI service]
+    UI -->|Internal API proxy| Server[Control plane]
+    Server --> State[In-memory control state]
     Agent[Data-plane decision agent] -->|Authenticated fetch| Policy[Policy service]
     Collector[Platform flow collector] -->|Hostname or SNI| Agent
     Agent --> Decision[Priority-overlay or direct decision]
@@ -17,6 +18,24 @@ flowchart LR
 ```
 
 The single Go process uses `net/http` and serves both the embedded dashboard and JSON API. A `sync.RWMutex` protects shared state, allowing concurrent reads while policy updates and route optimization mutate the client state safely.
+
+## Repository Layout
+
+```text
+cmd/
+    ui-service/                    Browser UI and internal API proxy
+    control-plane/                 Dashboard and local control API
+        policy-service/              Authenticated policy distribution
+    data-plane/
+        agent/                       Flow-decision API used by native adapters
+    observability/
+        metrics-server/              Performance and bandwidth ingestion
+internal/
+    policy/                        Shared domain matching and policy model
+deploy/                          Docker image, Compose stack, and environment template
+```
+
+The UI service owns browser presentation and proxies only control-plane API traffic. The control plane owns user-facing configuration and policy distribution but is internal-only in the Compose deployment. The data plane owns flow classification decisions and remains independent from the browser UI. Observability receives measurements and does not participate in routing decisions.
 
 ## Policy Model
 

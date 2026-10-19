@@ -2,10 +2,11 @@ services:
   control-plane:
     build:
       context: .
+      dockerfile: deploy/Dockerfile
       args:
-        TARGET: .
-    ports:
-      - "127.0.0.1:8080:8080"
+        TARGET: ./cmd/control-plane
+    expose:
+      - "8080"
     read_only: true
     tmpfs:
       - /tmp
@@ -15,11 +16,38 @@ services:
       - ALL
     restart: unless-stopped
 
+  ui-service:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+      args:
+        TARGET: ./cmd/ui-service
+    environment:
+      CONTROL_PLANE_URL: http://control-plane:8080
+    depends_on:
+      - control-plane
+    ports:
+      - "127.0.0.1:8080:8080"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
   policy-service:
     build:
       context: .
+      dockerfile: deploy/Dockerfile
       args:
-        TARGET: ./cmd/policy-service
+        TARGET: ./cmd/control-plane/policy-service
     environment:
       POLICY_SERVICE_TOKEN: ${POLICY_SERVICE_TOKEN:?set POLICY_SERVICE_TOKEN in .env}
     expose:
@@ -41,8 +69,9 @@ services:
   dataplane-agent:
     build:
       context: .
+      dockerfile: deploy/Dockerfile
       args:
-        TARGET: ./cmd/dataplane-agent
+        TARGET: ./cmd/data-plane/agent
     environment:
       POLICY_SERVICE_URL: http://policy-service:8081
       POLICY_SERVICE_TOKEN: ${POLICY_SERVICE_TOKEN:?set POLICY_SERVICE_TOKEN in .env}
@@ -85,8 +114,9 @@ services:
   metrics-server:
     build:
       context: .
+      dockerfile: deploy/Dockerfile
       args:
-        TARGET: ./cmd/metrics-server
+        TARGET: ./cmd/observability/metrics-server
     environment:
       INFLUX_URL: http://timeseries-db:8086
       INFLUX_TOKEN: ${INFLUXDB_ADMIN_TOKEN:?set INFLUXDB_ADMIN_TOKEN in .env}

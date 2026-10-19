@@ -19,11 +19,11 @@ type flow struct {
 }
 
 type decision struct {
-	Action       string `json:"action"`
-	Priority     string `json:"priority"`
-	MatchedRule  string `json:"matchedRule,omitempty"`
+	Action        string `json:"action"`
+	Priority      string `json:"priority"`
+	MatchedRule   string `json:"matchedRule,omitempty"`
 	PolicyVersion string `json:"policyVersion"`
-	Mode         string `json:"mode"`
+	Mode          string `json:"mode"`
 }
 
 type policyClient struct {
@@ -35,6 +35,7 @@ type policyClient struct {
 	expiresAt  time.Time
 }
 
+// main starts the local flow-decision API used by platform-native adapters.
 func main() {
 	token := os.Getenv("POLICY_SERVICE_TOKEN")
 	if len(token) < 32 {
@@ -61,10 +62,12 @@ func main() {
 	log.Fatal(server.ListenAndServe())
 }
 
+// health reports that the data-plane agent is available.
 func health(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// evaluate matches an observed hostname to policy and returns its routing action.
 func (c *policyClient) evaluate(mode string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
@@ -89,6 +92,7 @@ func (c *policyClient) evaluate(mode string) http.HandlerFunc {
 	}
 }
 
+// getSnapshot returns a cached policy or fetches a fresh authenticated snapshot.
 func (c *policyClient) getSnapshot(ctx context.Context) (policy.Snapshot, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

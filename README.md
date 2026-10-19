@@ -11,7 +11,7 @@ PulseRoute is a lightweight Go prototype for a laptop SD-WAN client control plan
 From the repository root:
 
 ```sh
-go run .
+go run ./cmd/control-plane
 ```
 
 Open http://localhost:8080 in a browser.
@@ -29,23 +29,29 @@ go test ./...
 Docker Desktop or a running Colima profile is required. Copy the environment template, replace the sample secret with a unique value of at least 32 characters, then start the stack:
 
 ```sh
-cp .env.example .env
-docker compose up --build
+cp deploy/.env.example .env
+docker compose -f deploy/docker-compose.yml up --build
 ```
 
-The control plane is available at http://localhost:8080, Grafana at http://localhost:3000, the data-plane decision API on loopback at http://localhost:8082, and metrics ingestion on loopback at http://localhost:8083. InfluxDB retains performance data for seven days. The Compose stack runs every custom Go service as non-root with a read-only filesystem and no Linux capabilities.
+The UI service is available at http://localhost:8080, Grafana at http://localhost:3000, the data-plane decision API on loopback at http://localhost:8082, and metrics ingestion on loopback at http://localhost:8083. InfluxDB retains performance data for seven days. The Compose stack runs every custom Go service as non-root with a read-only filesystem and no Linux capabilities.
+
+## UI Service
+
+`ui-service` is the browser-facing microservice. It serves the PulseRoute dashboard and forwards only `/api/*` browser requests to the internal control plane. The control plane is not exposed on a host port in the Compose deployment.
+
+The UI does not replace the API: it uses the API to read state and perform actions such as enabling all policies or optimizing routes. Keeping this contract lets the browser UI, a future desktop app, and automated clients use the same tested control-plane behavior without exposing internal services directly to the browser.
 
 For Colima:
 
 ```sh
 colima start
-docker compose up --build
+docker compose -f deploy/docker-compose.yml up --build
 ```
 
 To stop the stack:
 
 ```sh
-docker compose down
+docker compose -f deploy/docker-compose.yml down
 ```
 
 ## API
@@ -54,11 +60,28 @@ docker compose down
 | --- | --- | --- |
 | `GET` | `/api/state` | Read connection, application, path, and activity state. |
 | `POST` | `/api/policies/{id}/toggle` | Enable or disable one application priority policy. |
+| `POST` | `/api/policies/enable-all` | Enable every configured application policy at high priority. |
 | `POST` | `/api/optimize` | Re-score paths and steer active applications to the best route. |
 | `POST` | `/api/connection` | Pause or resume SD-WAN protection. |
-| `POST` | `http://localhost:8082/v1/flows/evaluate` | Evaluate an observed hostname against the centrally served work-traffic policy. |
+| `POST` | `http://localhost:8082/v1/flows/evaluate` | Decide whether an observed hostname should use the priority overlay or normal internet. |
 
-For example:
+### Dashboard control API
+
+The first four endpoints are used by the local dashboard at http://localhost:8080. They manage the client state shown in the UI:
+
+- `GET /api/state` returns protected applications, available routes, current connection state, and recent routing activity.
+- `POST /api/policies/{id}/toggle` enables or disables one configured application. An enabled work application is assigned `High` priority; a disabled one uses normal direct internet.
+- `POST /api/policies/enable-all` restores every configured application to enabled, `High` priority protection on the selected path. Use it to recover from individual policy changes.
+- `POST /api/optimize` re-scores the configured paths using the prototype's latency and jitter measurements, then assigns protected applications to the best path.
+- `POST /api/connection` pauses or resumes the dashboard's SD-WAN protection state.
+
+These dashboard APIs model the control-plane experience. They are not operating-system packet-routing commands.
+
+### Flow-decision API
+
+`POST http://localhost:8082/v1/flows/evaluate` is the contract between a future native traffic collector and the Go data-plane decision agent. The native collector identifies a destination hostname from DNS, TLS SNI, or a platform application rule, then asks the agent how that flow should be handled.
+
+For example, this asks how to handle a connection to GitHub:
 
 ```sh
 curl -X POST http://localhost:8082/v1/flows/evaluate \
@@ -66,7 +89,38 @@ curl -X POST http://localhost:8082/v1/flows/evaluate \
 	--data '{"hostname":"api.github.com"}'
 ```
 
-The response contains either `priority-overlay` for matched work traffic or `direct-internet` for unmatched traffic. `DATAPLANE_MODE=observe` is the default; it returns decisions without changing host routing.
+GitHub is included in the work-traffic policy, so the response is similar to:
+
+```json
+{
+	"action": "priority-overlay",
+	"priority": "high",
+	"matchedRule": "github",
+	"policyVersion": "2026-10-19.1",
+	"mode": "observe"
+}
+```
+
+`priority-overlay` means the future native adapter should send that flow through the managed, health-checked tunnel. `matchedRule` identifies the policy rule responsible for the decision, and `policyVersion` makes the decision auditable.
+
+For a hostname that does not match a work rule, the response is similar to:
+
+```json
+{
+	"action": "direct-internet",
+	"priority": "standard",
+	"policyVersion": "2026-10-19.1",
+	"mode": "observe"
+}
+```
+
+`direct-internet` means household and unrelated traffic keeps its normal route. This avoids consuming tunnel capacity or degrading personal traffic.
+
+### Observe and enforce modes
+
+`DATAPLANE_MODE=observe` is the default. The agent records and returns decisions but makes no operating-system routing changes. It is the appropriate mode for local validation and rollout telemetry.
+
+`DATAPLANE_MODE=enforce` still requires a platform-native adapter to apply the decision. On macOS, that is a signed Network Extension Packet Tunnel; on Linux/Ubuntu, it is an eBPF or nftables classifier combined with WireGuard; on Windows, it is a Windows Filtering Platform adapter. That component must fail open to direct internet if the tunnel or local agent becomes unhealthy.
 
 ## Scope
 

@@ -12,6 +12,7 @@ import (
 	"sdwan-client-core/internal/policy"
 )
 
+// main starts the authenticated policy distribution service.
 func main() {
 	token := os.Getenv("POLICY_SERVICE_TOKEN")
 	if len(token) < 32 {
@@ -34,10 +35,12 @@ func main() {
 	log.Fatal(server.ListenAndServe())
 }
 
+// health reports that the policy service can accept requests.
 func health(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// snapshot authenticates callers and returns the current versioned policy set.
 func snapshot(token string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		provided := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
@@ -51,6 +54,7 @@ func snapshot(token string) http.HandlerFunc {
 	}
 }
 
+// securityHeaders adds baseline response hardening before invoking a handler.
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
