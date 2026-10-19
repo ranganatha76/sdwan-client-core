@@ -10,9 +10,18 @@ The Go service layer is safe to run locally: it makes and records routing decisi
 
 Remote users often reach work applications through changing home, mobile, and public networks. A corporate VPN or security service such as Cisco AnyConnect or Zscaler remains responsible for identity, secure access, inspection, and corporate routing, but it does not necessarily make per-application decisions based on current path quality. A collaboration call, source-control operation, and personal streaming session can otherwise compete for the same constrained link or follow a path with excessive latency, jitter, or loss.
 
-PulseRoute is an optional, policy-controlled decision layer alongside that approved security client. It maps recognized work destinations to a priority policy, consumes measurements from an authorized device probe or gateway, selects the highest-quality permitted path, and records the resulting baseline versus optimized performance. Personal and unmatched traffic stays on its ordinary internet route. If policy, telemetry, the agent, or the overlay is unavailable, the system fails open to normal routing rather than blocking access.
+PulseRoute is an optional, policy-controlled decision layer alongside that approved security client. It maps recognized work destinations to a priority policy, consumes measurements from an authorized device probe or gateway, selects the highest-quality permitted path, and records the resulting baseline versus optimized performance. Personal and unmatched traffic stays on its ordinary internet route only where the organization's VPN/SSE policy permits local breakout. If policy, telemetry, the agent, or the overlay is unavailable, the current native implementation fails open to normal routing rather than blocking access.
 
 PulseRoute is not a VPN replacement or a mechanism to bypass corporate controls. It is only deployable where the organization permits split routing or an approved SD-WAN overlay integrated with its existing VPN/SSE policy.
+
+## Corporate VPN Integration
+
+PulseRoute has two mutually exclusive organization-selected deployment models:
+
+1. **Existing corporate VPN/SSE:** The existing AnyConnect, Zscaler, GlobalProtect, or comparable client remains responsible for tunnel establishment and corporate routing. PulseRoute may observe the connection and apply only organization-approved local QoS or routing behavior; it cannot create a path that escapes a full-tunnel VPN.
+2. **Organization-managed PulseRoute overlay:** The organization provisions device identity, WireGuard or IPsec tunnels, gateway forwarding, egress controls, and logging. The overlay is an organization-approved VPN for eligible traffic, not a consumer VPN or a bypass around security controls.
+
+`direct-internet` is a policy result only for traffic that the organization has explicitly approved for local breakout. In a full-tunnel deployment, the native adapter must retain the corporate VPN path for protected work traffic. The current Linux adapter is intentionally fail-open and therefore cannot enforce a tunnel-only, fail-closed policy.
 
 ## Goals
 

@@ -1,3 +1,5 @@
+
+The dashboard starts in a pending-measurement state and refuses optimization until it accepts one complete path-probe cycle. It does not publish route-performance telemetry from the former fixture values, so Grafana improvement panels represent accepted probe data rather than dashboard defaults.
 # PulseRoute SD-WAN Client
 
 PulseRoute is a lightweight Go prototype for a laptop SD-WAN client control plane. It presents routing health, prioritizes business and productivity applications, and lets a user simulate route optimization from a local web dashboard.
@@ -9,6 +11,15 @@ PulseRoute is an application-aware routing and observability layer for remote wo
 An enterprise VPN provides identity, secure access, inspection, and corporate routing. PulseRoute adds a decision layer that can identify approved work applications, compare approved network paths, and choose a preferred path for latency-sensitive traffic such as Zoom, Teams, Slack, GitHub, Bitbucket, and productivity SaaS applications. Unmatched personal traffic remains on its ordinary internet route.
 
 This is useful only where corporate network policy permits the required split-routing or approved overlay integration. It must never bypass a full-tunnel, inspection, or security policy imposed by the corporate VPN. In a production deployment, an authorized native adapter and gateway enforce the selected path; the local Go services alone do not alter host traffic.
+
+### Corporate VPN Deployment Models
+
+PulseRoute supports two organization-controlled deployment models; the organization, not an end user, selects and provisions one.
+
+1. **Existing VPN/SSE integration:** Cisco AnyConnect, Zscaler, GlobalProtect, or a comparable corporate client remains the tunnel owner. PulseRoute observes its health and may apply only local QoS or routing actions explicitly supported by the organization's VPN and split-tunnel policy. It does not create an alternate path around that VPN.
+2. **Approved PulseRoute overlay:** the organization provisions WireGuard or IPsec device-to-gateway tunnels, gateway egress, identity, and policy. PulseRoute can steer eligible work traffic through that overlay. This overlay is itself an organization-managed VPN and must meet the same security, inspection, logging, and access-control requirements as the existing remote-access service.
+
+When a corporate VPN is full-tunnel, PulseRoute must retain that VPN as the required work-traffic path. `direct-internet` is only valid for traffic and deployment modes that the organization's policy explicitly permits to use local breakout.
 
 ## Prerequisites
 
@@ -31,6 +42,10 @@ The dashboard starts with high-priority policies enabled for collaboration, engi
 ```sh
 go test ./...
 ```
+
+## Zero-Cost Performance Lab
+
+Use the [Linux namespace lab](deploy/lab/README.md) on a Linux VM to create two ephemeral WireGuard paths, impair the primary path with `tc netem`, select the healthy backup path, and capture baseline/degraded/recovered latency and loss. It uses only Linux networking tools and temporary in-memory keys; it does not require a paid VPN or SSE provider.
 
 ## Run with Docker or Colima
 
@@ -192,7 +207,7 @@ The Linux enforcer can apply an explicit hostname and destination-IP evaluation.
 
 `DATAPLANE_MODE=observe` is the default. The agent records and returns decisions but makes no operating-system routing changes. It is the appropriate mode for local validation and rollout telemetry.
 
-`DATAPLANE_MODE=enforce` still requires a platform-native adapter to apply the decision. On macOS, that is a signed Network Extension Packet Tunnel; on Linux/Ubuntu, the supplied nftables/WireGuard enforcer applies policy routing and QoS after an authoritative hostname collector invokes it; on Windows, it is a Windows Filtering Platform adapter. That component must fail open to direct internet if the tunnel or local agent becomes unhealthy.
+`DATAPLANE_MODE=enforce` still requires a platform-native adapter to apply the decision. On macOS, that is a signed Network Extension Packet Tunnel; on Linux/Ubuntu, the supplied nftables/WireGuard enforcer applies policy routing and QoS after an authoritative hostname collector invokes it; on Windows, it is a Windows Filtering Platform adapter. The current Linux adapter fails open to normal routing if the tunnel or local agent becomes unhealthy. A production tunnel-only policy needs a separately approved, fail-closed native implementation with explicit bootstrap and emergency-access allowlists; it is not implemented by this prototype.
 
 ## Scope
 

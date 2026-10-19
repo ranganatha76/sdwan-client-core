@@ -72,6 +72,37 @@ func TestSelectBestPathUsesCurrentQualityScore(t *testing.T) {
 	}
 }
 
+// TestOptimizeRejectsFixtureState ensures the dashboard cannot claim a route improvement before a real probe cycle.
+func TestOptimizeRejectsFixtureState(t *testing.T) {
+	server := &server{state: initialState()}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/optimize", nil)
+
+	server.optimize(recorder, request)
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("expected conflict before measurements, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// TestInitialStateDoesNotClaimMeasuredPerformance ensures a fresh dashboard cannot be mistaken for a pilot result.
+func TestInitialStateDoesNotClaimMeasuredPerformance(t *testing.T) {
+	state := initialState()
+	if state.MeasurementsReady {
+		t.Fatal("fresh state must require a real measurement cycle")
+	}
+	for _, app := range state.Apps {
+		if app.Route != "Awaiting probe" || app.Health != "Pending measurement" {
+			t.Errorf("%s reports measured routing state: route=%q health=%q", app.ID, app.Route, app.Health)
+		}
+	}
+	for _, path := range state.Paths {
+		if path.Selected || path.Loss != "--" || path.Latency != 0 || path.Jitter != 0 || path.Score != 0 {
+			t.Errorf("%s reports fixture performance: %#v", path.Name, path)
+		}
+	}
+}
+
 // TestRecordPathMeasurementsSelectsBestReportedPath verifies end-to-end probe-driven routing.
 // It posts a complete fresh measurement cycle in which LTE has the best derived score.
 // The handler must accept the payload, select LTE, and route every active app through it.
