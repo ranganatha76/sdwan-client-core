@@ -43,9 +43,17 @@ The watchdog runs the rollback when the WireGuard device or local agent is unava
 
 ## macOS
 
-`macos/PulseRouteNetworkExtension/PacketTunnelProvider.swift` is source for an Xcode Packet Tunnel Network Extension target. The host application supplies hostname metadata through `handleAppMessage`; the extension calls the local Go agent and returns the decision to the host app.
+`macos/PulseRoute.xcodeproj` contains a host application and Packet Tunnel Network Extension target. The host application supplies hostname metadata through `handleAppMessage`; the extension calls the local Go agent and returns the decision to the host app.
 
-To build and install it, create a signed macOS app and Packet Tunnel target in Xcode, add this provider source, configure an Apple Developer Team with the Network Extension entitlement, and provision real gateway settings from device policy. Docker and Colima cannot grant the entitlement or intercept Mac host traffic.
+Build the unsigned source locally after installing Xcode:
+
+```sh
+xcodebuild -project native/macos/PulseRoute.xcodeproj -scheme PulseRoute -configuration Debug -sdk macosx CODE_SIGNING_ALLOWED=NO build
+```
+
+For a deployable build, open the project in Xcode, assign a unique bundle ID in place of `com.pulseroute.client`, select an enrolled Apple Developer Team for both targets, and enable the Packet Tunnel Network Extension capability for that app identifier. Xcode must then generate an Apple Development identity and matching provisioning profiles. Docker and Colima cannot grant the entitlement or intercept Mac host traffic.
+
+The MDM or host app must provide `remoteAddress`, `ipv4Address`, `ipv4SubnetMask`, and `agentURL` in `NEPacketTunnelProviderProtocol.providerConfiguration`. The extension rejects incomplete settings. `agentURL` must use HTTPS unless it is the loopback address `127.0.0.1` for the local decision agent.
 
 The current extension source proves the adapter-to-agent contract. Full per-flow forwarding needs a deployed gateway protocol and packet flow classification logic, which must be implemented and tested under the approved entitlement.
 

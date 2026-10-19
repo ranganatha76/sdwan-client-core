@@ -55,7 +55,7 @@ deploy/                             Docker image, Compose stack, environment tem
 native/
   linux/enforcer/                   Root-owned WireGuard route and QoS enforcer
   linux/systemd/                    Fail-open enforcement watchdog unit
-  macos/                            Packet Tunnel provider source scaffold
+  macos/                            Host app and Packet Tunnel Xcode project
 CodeWalkThrough.md                  Service and request-flow guide
 README.md                           Setup and API reference
 ```
@@ -131,7 +131,7 @@ The UI runs on `http://localhost:8080`, Grafana on `http://localhost:3000`, and 
 The Go service layer is portable. Only interception and enforcement differ by OS:
 
 - **Linux/Ubuntu**: the implemented `pulseroute-enforcer` uses nftables destination sets, an output-chain firewall mark, and an `ip rule` plus dedicated route table to steer approved IPv4 destinations through a pre-existing WireGuard device. It configures HTB classes on that device. High-priority overlay decisions are entered in a separate set, receive configured DSCP (`cs5` by default), and select HTB class `1:10`; standard overlay traffic uses the default class. `uninstall` deletes only PulseRoute's nftables table, route rule/table, and root qdisc. The `pulseroute-enforcer.service` watchdog checks local agent readiness and WireGuard device existence; on failure it removes those rules so traffic returns to the normal direct route. The root-owned JSON configuration includes the WireGuard device, route table, firewall mark, link rate, high-priority allocation, DSCP, and watchdog interval. It must not contain WireGuard private keys.
-- **macOS**: a signed Packet Tunnel Network Extension receives packets with `NEPacketTunnelFlow`, consults the local agent, and forwards approved traffic over the overlay. It requires Apple Network Extension entitlement, provisioning, user approval, and notarized packaging.
+- **macOS**: `PulseRoute.xcodeproj` builds an unsigned host app and embedded Packet Tunnel target. The provider reads `remoteAddress`, `ipv4Address`, `ipv4SubnetMask`, and `agentURL` from managed `providerConfiguration`, refuses incomplete values, and consults the local agent for hostname decisions. It requires an Apple Developer Team, Network Extension entitlement, provisioning, user approval, signing, and notarized packaging before installation. Packet-flow classification and gateway forwarding are not yet implemented.
 - **Windows**: a signed least-privileged service uses Windows Filtering Platform to associate flows with hostname metadata, calls the agent, and selects overlay or direct routing.
 
 Linux operators must set WireGuard `PersistentKeepalive` and add gateway-path monitoring: interface existence alone does not prove the overlay peer is reachable. The enforcer accepts IPv4 destinations only; IPv6 policy enforcement is not implemented. Every adapter should begin in observe mode, emit measurements, be canaried to managed devices, and preserve direct internet as the failure path.
