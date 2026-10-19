@@ -245,8 +245,8 @@ sequenceDiagram
   Enforcer->>Kernel: Add IP to priority_destinations for 10 minutes
   Enforcer->>Kernel: Add IP to high_priority_destinations for 10 minutes
   App->>Kernel: Send inner IPv4 packet to matched destination
-  Kernel->>Kernel: Set firewallMark; select policy route table
-  Kernel->>Kernel: Set DSCP cs5; select HTB class 1:10
+  Kernel->>Kernel: Set firewall mark then select policy route table
+  Kernel->>Kernel: Set DSCP cs5 then select HTB class 1:10
   Kernel->>WG: Send selected inner packet
   WG->>Gateway: Encrypt and send WireGuard UDP packet
   Gateway->>SaaS: Decrypt and forward through managed egress
