@@ -33,6 +33,14 @@ cp deploy/.env.example .env
 docker compose -f deploy/docker-compose.yml up --build
 ```
 
+Or use the production-stack launcher, which validates distinct secrets, builds and starts every Compose service, waits for health checks, and verifies the local HTTP endpoints:
+
+```sh
+python3 start_up.py
+```
+
+Use `python3 start_up.py --skip-build` to reuse existing images. The launcher starts the browser UI, control plane, policy service, data-plane decision agent, InfluxDB, metrics service, and Grafana. It does not install or start the platform-native Linux enforcer or macOS Packet Tunnel because those require separately provisioned operating-system privileges, WireGuard gateway settings, and Apple entitlement/signing.
+
 The UI service is available at http://localhost:8080, Grafana at http://localhost:3000, the data-plane decision API on loopback at http://localhost:8082, and metrics ingestion on loopback at http://localhost:8083. InfluxDB retains performance data for seven days. Grafana automatically provisions the `PulseRoute Performance` dashboard and its InfluxDB data source. The Compose stack runs every custom Go service as non-root with a read-only filesystem and no Linux capabilities. Compose health checks require the control plane, policy snapshot, and InfluxDB before dependent services are treated as ready.
 
 ## UI Service
