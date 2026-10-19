@@ -9,9 +9,10 @@ Provide a small, software-only SD-WAN client that gives work traffic priority ov
 ```mermaid
 flowchart LR
     Browser[Local browser] -->|HTTP| Server[Go HTTP server]
-    Server --> State[In-memory client state]
-    State --> Policies[Application policies]
-    State --> Paths[Path health]
+    Server --> State[In-memory UI state]
+    Agent[Data-plane decision agent] -->|Authenticated fetch| Policy[Policy service]
+    Collector[Platform flow collector] -->|Hostname or SNI| Agent
+    Agent --> Decision[Priority-overlay or direct decision]
     Server --> Dashboard[Embedded dashboard]
 ```
 
@@ -44,3 +45,25 @@ The current implementation is intentionally a control-plane simulation. A produc
 5. Authentication, policy distribution, telemetry, and audit logging.
 
 Those additions should retain the current API as a local observability and user-control surface, while isolating privileged networking code behind a narrow interface.
+
+## Container Services
+
+The Compose deployment separates three processes:
+
+- `control-plane` hosts the local dashboard on loopback port `8080`.
+- `policy-service` serves an authenticated, versioned work-application policy snapshot only on the internal Compose network.
+- `dataplane-agent` exposes `POST /v1/flows/evaluate` on loopback port `8082`. It fetches and caches policy for 30 seconds, then returns either `priority-overlay` or `direct-internet` for an observed hostname.
+
+All containers run as non-root, have a read-only filesystem, drop Linux capabilities, and use bounded HTTP timeouts. The shared policy token is supplied at runtime through `.env`, never baked into an image.
+
+## Production Data Plane
+
+The agent is deliberately a decision service, not a privileged packet interceptor. A real endpoint data plane must be installed as a signed, OS-specific component with narrowly scoped permissions. On Linux it can connect an eBPF or nftables flow collector to the agent; on macOS it should use Network Extension APIs; and on Windows it should use Windows Filtering Platform. That privileged component should enforce the returned action through a managed overlay tunnel, retain a direct-route fail-open policy, and emit audited decisions.
+
+### Linux
+
+The enforcement component should classify flows at the socket or traffic-control layer, associate DNS or TLS SNI metadata with the flow, and ask the local agent for a decision. A `priority-overlay` decision must mark only the matching flow, select the configured WireGuard route table, and retain normal routing for policy-service failures or tunnel health failures. It must run with the least host privileges necessary and keep WireGuard private keys in an OS secret store.
+
+### macOS
+
+The enforcement component must be a signed Packet Tunnel Network Extension. It receives packets through `NEPacketTunnelFlow`, sends flow metadata to the local agent, and forwards only approved priority traffic through an authenticated gateway. Enabling this requires an Apple Developer Team, the Network Extension entitlement, user approval, and a packaged app; containers cannot grant these capabilities.
