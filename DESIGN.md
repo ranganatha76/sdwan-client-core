@@ -191,6 +191,175 @@ The watchdog checks local data-plane-agent readiness and WireGuard device existe
 
 The repository implements explicit Linux destination evaluation and application of nftables, policy-routing, DSCP, and HTB state. It does not yet implement the authoritative DNS/SNI collector, WireGuard peer provisioning, gateway forwarding/NAT, IPv6 split tunneling, or active gateway-path measurement. Those components are required before claiming autonomous per-application production steering.
 
+### Scenario Sequences
+
+The following sequences describe the intended production flow. The collector is a required future component; today an operator or an external collector invokes the Linux enforcer explicitly with a hostname and destination IPv4 address.
+
+#### 1. Unmatched Traffic Uses Direct Internet
+
+This scenario covers personal or unrecognized traffic, such as a streaming, gaming, or household destination that does not match a work policy rule.
+
+```mermaid
+sequenceDiagram
+  participant App as Application
+  participant Collector as DNS/SNI collector
+  participant Agent as Data-plane agent
+  participant Policy as Policy service
+  participant Kernel as Linux routing
+  participant Internet as Direct internet
+
+  App->>Collector: Resolve or connect to unmatched hostname
+  Collector->>Agent: POST /v1/flows/evaluate(hostname)
+  Agent->>Policy: GET /v1/policy/snapshot with bearer token
+  Policy-->>Agent: Versioned policy snapshot
+  Agent-->>Collector: direct-internet, standard, policyVersion
+  Note over Collector,Kernel: No destination is added to PulseRoute nftables sets
+  App->>Kernel: Send IP packet
+  Kernel->>Internet: Use existing default route
+```
+
+The packet receives no PulseRoute firewall mark, DSCP value, or traffic-control class. It does not enter WireGuard and the SD-WAN gateway never sees it.
+
+#### 2. High-Priority Work Traffic Uses the Overlay
+
+This scenario covers a matched work hostname when the agent is in `enforce` mode, for example Zoom, Slack, Teams, or GitHub.
+
+```mermaid
+sequenceDiagram
+  participant App as Work application
+  participant Collector as DNS/SNI collector
+  participant Agent as Data-plane agent
+  participant Policy as Policy service
+  participant Enforcer as Linux enforcer
+  participant Kernel as nftables, ip rule, tc
+  participant WG as WireGuard laptop interface
+  participant Gateway as SD-WAN gateway
+  participant SaaS as SaaS destination
+
+  App->>Collector: Resolve or connect to matched hostname
+  Collector->>Agent: POST /v1/flows/evaluate(hostname)
+  Agent->>Policy: Fetch or use cached policy snapshot
+  Policy-->>Agent: Matching high-priority rule
+  Agent-->>Collector: priority-overlay, high, enforce, matchedRule
+  Collector->>Enforcer: Evaluate hostname and destination IPv4
+  Enforcer->>Kernel: Add IP to priority_destinations for 10 minutes
+  Enforcer->>Kernel: Add IP to high_priority_destinations for 10 minutes
+  App->>Kernel: Send inner IPv4 packet to matched destination
+  Kernel->>Kernel: Set firewallMark; select policy route table
+  Kernel->>Kernel: Set DSCP cs5; select HTB class 1:10
+  Kernel->>WG: Send selected inner packet
+  WG->>Gateway: Encrypt and send WireGuard UDP packet
+  Gateway->>SaaS: Decrypt and forward through managed egress
+  SaaS-->>Gateway: Return packet
+  Gateway-->>WG: Encrypt return packet to laptop peer
+  WG-->>App: Decrypt and deliver reply
+```
+
+The high-priority DSCP and HTB class are local laptop egress controls. The gateway needs a WireGuard peer, forwarding/firewall policy, and NAT or return routing for the symmetric reply path. The gateway's egress path must be better than direct internet for this route to improve application performance.
+
+#### 3. Matched Work Traffic in Observe Mode
+
+Observe mode is used for rollout validation and telemetry. A policy match is returned but must not change kernel packet state.
+
+```mermaid
+sequenceDiagram
+  participant Collector as DNS/SNI collector
+  participant Agent as Data-plane agent
+  participant Policy as Policy service
+  participant Enforcer as Linux enforcer
+  participant Kernel as Linux routing
+  participant Internet as Direct internet
+
+  Collector->>Agent: POST /v1/flows/evaluate(work hostname)
+  Agent->>Policy: Fetch or use cached policy snapshot
+  Policy-->>Agent: Matching work rule
+  Agent-->>Collector: priority-overlay, high, observe
+  Collector->>Enforcer: Evaluate hostname and destination IPv4
+  Enforcer->>Enforcer: Reject route change because mode is observe
+  Note over Enforcer,Kernel: No nftables set, route mark, DSCP, or tc update
+  Kernel->>Internet: Keep normal default route
+```
+
+This validates policy coverage and decision behavior without sending customer traffic through a new overlay path.
+
+#### 4. Policy or Agent Is Unavailable
+
+The adapter must not create new overlay routing state when it cannot obtain a trustworthy policy decision. Existing overlay state is handled by the watchdog scenario below.
+
+```mermaid
+sequenceDiagram
+  participant Collector as DNS/SNI collector
+  participant Agent as Data-plane agent
+  participant Policy as Policy service
+  participant Enforcer as Linux enforcer
+  participant Kernel as Linux routing
+  participant Internet as Direct internet
+
+  Collector->>Agent: POST /v1/flows/evaluate(hostname)
+  Agent->>Policy: Request fresh policy snapshot
+  Policy--x Agent: Timeout, unavailable, or unauthorized
+  Agent-->>Collector: HTTP 503 policy unavailable
+  Collector->>Enforcer: Do not request destination insertion
+  Note over Enforcer,Kernel: No new PulseRoute packet state is created
+  Kernel->>Internet: New unmatched flows use normal default route
+```
+
+The agent caches a valid policy snapshot for 30 seconds. Within that cache interval it can continue evaluating flows from the last authenticated snapshot; after expiry, unavailable policy produces `503` rather than an untrusted decision.
+
+#### 5. WireGuard or Agent Health Fails Open
+
+The systemd watchdog periodically checks the local agent readiness endpoint and WireGuard device existence. It removes only PulseRoute-owned networking state when either check fails.
+
+```mermaid
+sequenceDiagram
+  participant Watchdog as pulseroute-enforcer.service
+  participant Agent as Data-plane agent /readyz
+  participant WG as WireGuard device
+  participant Enforcer as Linux enforcer
+  participant Kernel as nftables, ip rule, tc
+  participant Internet as Direct internet
+
+  loop Every healthCheckIntervalSec
+    Watchdog->>Agent: GET /readyz
+    Watchdog->>WG: ip link show device
+  end
+  alt Agent ready and WireGuard device exists
+    Watchdog->>Enforcer: Reconcile install state
+    Enforcer->>Kernel: Retain PulseRoute nftables, route, and QoS state
+  else Agent unavailable or device absent
+    Watchdog->>Enforcer: Run uninstall rollback
+    Enforcer->>Kernel: Delete PulseRoute nftables table
+    Enforcer->>Kernel: Delete firewall-mark ip rule and route table entries
+    Enforcer->>Kernel: Delete WireGuard root qdisc
+    Kernel->>Internet: Send all subsequent traffic by normal default route
+  end
+```
+
+This is fail-open, not fail-closed: a control-plane, agent, or local WireGuard-device failure must not block laptop internet access. Gateway reachability needs stronger checks than device existence, such as WireGuard handshake age and active probes, before a production rollout relies on this watchdog alone.
+
+#### 6. Performance Measurement and Dashboarding
+
+The metrics path is independent from packet steering. A native adapter or collector submits measured baseline and optimized values; Grafana displays only the values it receives.
+
+```mermaid
+sequenceDiagram
+  participant Adapter as Native adapter or collector
+  participant Metrics as Metrics server
+  participant Influx as InfluxDB performance bucket
+  participant Grafana as Grafana dashboard
+  participant Operator as Operator
+
+  Adapter->>Metrics: POST /v1/measurements(application, latency, loss, bandwidth)
+  Metrics->>Metrics: Validate tag and non-negative fields
+  Metrics->>Influx: Write application_performance line protocol
+  Influx-->>Metrics: 204 accepted
+  Grafana->>Influx: Flux query for selected time range
+  Influx-->>Grafana: Latency, loss, bandwidth measurements
+  Grafana-->>Operator: Baseline versus optimized panels and improvement trend
+```
+
+The dashboard does not prove an overlay benefit by itself. Measurements must compare equivalent workloads and time windows, and the adapter must record both direct-path baseline and overlay-path values before any performance claim is made.
+
 ## Production Readiness Roadmap
 
 1. Replace static policy data with signed, versioned, remotely managed policies.
