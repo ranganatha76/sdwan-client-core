@@ -1,0 +1,6 @@
+{
+  "agentURL": "http://127.0.0.1:8082",
+  "wireGuardDevice": "wg-pulseroute",
+  "routeTable": 51820,
+  "firewallMark": 51820
+}
