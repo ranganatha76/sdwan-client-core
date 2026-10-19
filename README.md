@@ -92,6 +92,7 @@ docker compose -f deploy/docker-compose.yml down
 | `POST` | `/api/optimize` | Apply the most recently reported path measurements to active applications. |
 | `POST` | `/api/connection` | Pause or resume SD-WAN protection. |
 | `POST` | `http://localhost:8082/v1/flows/evaluate` | Decide whether an observed hostname should use the priority overlay or normal internet. |
+| `POST` | `http://localhost:8083/v1/endpoint-telemetry` | Store observe-only endpoint network and VPN health for Grafana. |
 
 ### Dashboard control API
 
@@ -105,6 +106,18 @@ The first four endpoints are used by the local dashboard at http://localhost:808
 - `POST /api/connection` pauses or resumes the dashboard's SD-WAN protection state.
 
 These dashboard APIs model the control-plane experience. They are not operating-system packet-routing commands.
+
+### Endpoint Telemetry API
+
+`POST http://localhost:8083/v1/endpoint-telemetry` accepts an observe-only endpoint health sample for Grafana. It stores a device identifier, network type, VPN provider/connection state, latency, jitter, loss, and byte counters. It does not accept packet payloads, destination hostnames, DNS queries, or application content.
+
+```sh
+curl -X POST http://localhost:8083/v1/endpoint-telemetry \
+	-H 'Content-Type: application/json' \
+	--data '{"deviceId":"laptop-001","networkType":"wifi","vpnProvider":"cisco-anyconnect","vpnConnected":true,"latencyMs":32,"jitterMs":4,"lossPct":0.1,"receiveBytes":1048576,"transmitBytes":524288}'
+```
+
+The `PulseRoute Performance` Grafana dashboard includes endpoint VPN-state and latency/jitter panels after samples are submitted.
 
 ### Flow-decision API
 
